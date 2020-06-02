@@ -1182,6 +1182,10 @@ class VectorSubs : public IRMutator {
             Stmt s = Store::make(store->name, b, store_index, store->param,
                                  const_true(b.type().lanes()), store->alignment);
 
+            // We may still need the atomic node, if there was more
+            // parallelism than just the vectorization.
+            s = Atomic::make(op->producer_name, op->mutex_name, s);
+
             return s;
         } while (0);
 
@@ -1273,7 +1277,6 @@ class FindVectorizableExprsInAtomicNode : public IRMutator {
         // Even if the load is bad, maybe we can lift the index
         IRMutator::visit(op);
 
-        // TODO: tuples?
         poison |= poisoned_names.contains(op->name);
         return op;
     }
@@ -1462,6 +1465,7 @@ Stmt vectorize_loops(const Stmt &stmt, const map<string, Function> &env, const T
     // for non-vectorizing stuff too.
     Stmt s = LiftVectorizableExprsOutOfAllAtomicNodes(env).mutate(stmt);
     s = VectorizeLoops(t).mutate(s);
+    // TODO: Some of the new atomic nodes aren't actually necessary
     return s;
 }
 

@@ -130,29 +130,10 @@ class SplitTuples : public IRMutator {
         }
     }
 
-    Stmt visit(const Provide *op) override {
+    Stmt visit_provide(const Provide *op, const Atomic *atomic = nullptr) {
+
         if (op->values.size() == 1) {
             return IRMutator::visit(op);
-        }
-
-        // Detect if the provide needs to be lowered atomically. By
-        // this we mean can we compute and store the values one at a
-        // time (not atomic), or must we compute them all, and then
-        // store them all (atomic).
-        bool atomic = false;
-        if (!realizations.contains(op->name) &&
-            uses_extern_image(op)) {
-            // If the provide is an output (it's not inside a
-            // realization), and it uses an input, then the input
-            // might alias with the output. We'd better just do it
-            // atomically.
-            atomic = true;
-        } else {
-            // If the boxes provided and required might overlap,
-            // the provide must be done atomically.
-            Box provided = box_provided(op, op->name);
-            Box required = box_required(op, op->name);
-            atomic = boxes_overlap(provided, required);
         }
 
         // Mutate the args
@@ -166,31 +147,124 @@ class SplitTuples : public IRMutator {
         internal_assert(it != env.end());
         Function f = it->second;
 
-        // Build a list of scalar provide statements, and a list of
-        // lets to wrap them.
-        vector<Stmt> provides;
-        vector<pair<string, Expr>> lets;
+        // For the new value of each tuple component, what existing
+        // tuple components does it already depend on?
+        vector<set<int>> dependencies(op->values.size());
+        for (int i = 0; i < (int)op->values.size(); i++) {
+            class Checker : public IRVisitor {
+                using IRVisitor::visit;
+                void visit(const Call *op) {
+                    if (op->call_type == Call::Halide &&
+                        op->name == func_name &&
+                        could_alias(op->args, store_args)) {
+                        deps.insert(op->value_index);
+                    }
+                }
 
-        for (size_t i = 0; i < op->values.size(); i++) {
-            string name = op->name + "." + std::to_string(i);
-            string var_name = name + ".value";
-            Expr val = mutate(op->values[i]);
-            if (!is_undef(val) && atomic) {
-                lets.emplace_back(var_name, val);
-                val = Variable::make(val.type(), var_name);
+                bool could_alias(const vector<Expr> &a, const vector<Expr> &b) {
+                    internal_assert(a.size() == b.size());
+                    if (a.empty()) {
+                        return true;
+                    }
+                    // TODO
+                    return true;
+                }
+
+            public:
+                set<int> &deps;
+                const string &func_name;
+                const vector<Expr> &store_args;
+                Checker(set<int> &deps,
+                        const string &func_name,
+                        const vector<Expr> &store_args)
+                    : deps(deps), func_name(func_name), store_args(store_args) {
+                }
+            } checker(dependencies[i], op->name, args);
+            op->values[i].accept(&checker);
+        }
+
+        // Build clusters of tuple components where two components
+        // share a cluster if there is cross-talk between them.
+        vector<vector<int>> clusters;
+        for (int i = 0; i < (int)op->values.size(); i++) {
+            // Does it belong to an existing cluster?
+            bool inserted_into_a_cluster = false;
+            for (auto &c : clusters) {
+                bool belongs_to_this_cluster = false;
+                for (int j : c) {
+                    if (dependencies[j].count(i) ||
+                        dependencies[i].count(j)) {
+                        belongs_to_this_cluster = true;
+                        break;
+                    }
+                }
+                if (belongs_to_this_cluster) {
+                    inserted_into_a_cluster = true;
+                    c.push_back(i);
+                    break;
+                }
             }
-            provides.push_back(Provide::make(name, {val}, args));
+            if (!inserted_into_a_cluster) {
+                // Make a new cluster
+                clusters.push_back(vector<int>{});
+                clusters.back().push_back(i);
+            }
         }
 
-        Stmt result = Block::make(provides);
+        // For each cluster, build a list of scalar provide
+        // statements, and a list of lets to wrap them.
+        vector<Stmt> result;
+        for (const auto &c : clusters) {
+            vector<Stmt> provides;
+            vector<pair<string, Expr>> lets;
 
-        while (!lets.empty()) {
-            auto p = lets.back();
-            lets.pop_back();
-            result = LetStmt::make(p.first, p.second, result);
+            Stmt s;
+
+            if (c.size() == 1) {
+                int i = *c.begin();
+                string name = op->name + "." + std::to_string(i);
+                s = Provide::make(name, {mutate(op->values[i])}, args);
+            } else {
+                for (auto i : c) {
+                    string name = op->name + "." + std::to_string(i);
+                    string var_name = name + ".value";
+                    Expr val = mutate(op->values[i]);
+                    if (!is_undef(val) && atomic) {
+                        lets.emplace_back(var_name, val);
+                        val = Variable::make(val.type(), var_name);
+                    }
+                    provides.push_back(Provide::make(name, {val}, args));
+                }
+
+                Stmt s = Block::make(provides);
+
+                while (!lets.empty()) {
+                    auto p = lets.back();
+                    lets.pop_back();
+                    s = LetStmt::make(p.first, p.second, s);
+                }
+            }
+
+            if (atomic) {
+                s = Atomic::make(atomic->producer_name, atomic->mutex_name, s);
+            }
+
+            result.push_back(s);
         }
 
-        return result;
+        return Block::make(result);
+    }
+
+    Stmt visit(const Provide *op) override {
+        return visit_provide(op, nullptr);
+    }
+
+    Stmt visit(const Atomic *op) override {
+        if (const Provide *p = op->body.as<Provide>()) {
+            return visit_provide(p, op);
+        } else {
+            return IRMutator::visit(op);
+        }
     }
 
     const map<string, Function> &env;
