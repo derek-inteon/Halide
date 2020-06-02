@@ -5,12 +5,16 @@
  * Defines the internal representation of the schedule for a function
  */
 
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "DeviceAPI.h"
 #include "Expr.h"
 #include "FunctionPtr.h"
 #include "Parameter.h"
-
-#include <map>
-#include <utility>
+#include "PrefetchDirective.h"
 
 namespace Halide {
 
@@ -83,26 +87,6 @@ enum class LoopAlignStrategy {
 
     /** By default, LoopAlignStrategy is set to NoAlign. */
     Auto
-};
-
-/** Different ways to handle accesses outside the original extents in a prefetch. */
-enum class PrefetchBoundStrategy {
-    /** Clamp the prefetched exprs by intersecting the prefetched region with
-     * the original extents. This may make the exprs of the prefetched region
-     * more complicated. */
-    Clamp,
-
-    /** Guard the prefetch with if-guards that ignores the prefetch if
-     * any of the prefetched region ever goes beyond the original extents
-     * (i.e. all or nothing). */
-    GuardWithIf,
-
-    /** Leave the prefetched exprs as are (no if-guards around the prefetch
-     * and no intersecting with the original extents). This makes the prefetch
-     * exprs simpler but this may cause prefetching of region outside the original
-     * extents. This is good if prefetch won't fault when accessing region
-     * outside the original extents. */
-    NonFaulting
 };
 
 /** A reference to a site in a Halide statement at the top of the
@@ -302,21 +286,24 @@ struct Split {
     }
 };
 
+enum class DimType {
+    PureVar = 0,
+    PureRVar,
+    ImpureRVar,
+};
+
 struct Dim {
     std::string var;
     ForType for_type;
     DeviceAPI device_api;
 
-    enum Type { PureVar = 0,
-                PureRVar,
-                ImpureRVar };
-    Type dim_type;
+    DimType dim_type;
 
     bool is_pure() const {
-        return (dim_type == PureVar) || (dim_type == PureRVar);
+        return (dim_type == DimType::PureVar) || (dim_type == DimType::PureRVar);
     }
     bool is_rvar() const {
-        return (dim_type == PureRVar) || (dim_type == ImpureRVar);
+        return (dim_type == DimType::PureRVar) || (dim_type == DimType::ImpureRVar);
     }
     bool is_unordered_parallel() const {
         return Halide::Internal::is_unordered_parallel(for_type);
@@ -376,15 +363,6 @@ struct FusedPair {
         }
         return stage_2 < other.stage_2;
     }
-};
-
-struct PrefetchDirective {
-    std::string name;
-    std::string var;
-    Expr offset;
-    PrefetchBoundStrategy strategy;
-    // If it's a prefetch load from an image parameter, this points to that.
-    Parameter param;
 };
 
 struct FuncScheduleContents;

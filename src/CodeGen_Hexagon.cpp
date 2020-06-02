@@ -19,6 +19,7 @@
 #include "LICM.h"
 #include "LLVM_Headers.h"
 #include "LoopCarry.h"
+#include "Monotonic.h"
 #include "Simplify.h"
 #include "Substitute.h"
 #include "Target.h"
@@ -102,30 +103,186 @@ bool is_dense_ramp(const Expr &x) {
 // buffers. Using this assumption, this mutator replaces vector
 // predicated dense loads with scalar predicated dense loads.
 class SloppyUnpredicateLoadsAndStores : public IRMutator {
+    using IRMutator::visit;
+
+    // The first and last lanes of all monotonic vectors in scope
+    Scope<std::pair<Expr, Expr>> monotonic_vectors;
+
+    // If a vector monotonically increases or decreases across the
+    // lanes, return the first and last lane.
+    std::pair<Expr, Expr> get_extreme_lanes(const Expr &e) {
+        if (const Ramp *r = e.as<Ramp>()) {
+            return {r->base, r->base + r->stride * (r->lanes - 1)};
+        } else if (const Broadcast *b = e.as<Broadcast>()) {
+            return {b->value, b->value};
+        } else if (const LT *op = e.as<LT>()) {
+            if (!op->a.type().is_bool()) {
+                auto a = get_extreme_lanes(op->a);
+                auto b = get_extreme_lanes(op->b);
+                if (a.first.defined() && b.first.defined()) {
+                    return {a.first < b.first, a.second < b.second};
+                }
+            }
+        } else if (const LE *op = e.as<LE>()) {
+            if (!op->a.type().is_bool()) {
+                auto a = get_extreme_lanes(op->a);
+                auto b = get_extreme_lanes(op->b);
+                if (a.first.defined() && b.first.defined()) {
+                    return {a.first <= b.first, a.second <= b.second};
+                }
+            }
+        } else if (const Variable *op = e.as<Variable>()) {
+            if (monotonic_vectors.contains(op->name)) {
+                return monotonic_vectors.get(op->name);
+            }
+        } else if (const Let *op = e.as<Let>()) {
+            auto v = get_extreme_lanes(op->value);
+            ScopedBinding<std::pair<Expr, Expr>> bind(v.first.defined(), monotonic_vectors, op->name, v);
+            return get_extreme_lanes(op->body);
+        }
+        return {Expr(), Expr()};
+    }
+
+    Expr visit(const Let *op) override {
+        auto v = get_extreme_lanes(op->value);
+        ScopedBinding<std::pair<Expr, Expr>> bind(op->value.type().is_vector() && v.first.defined(),
+                                                  monotonic_vectors, op->name, v);
+        return IRMutator::visit(op);
+    }
+
     Expr visit(const Load *op) override {
-        // Don't handle loads with without predicates, scalar predicates, or
-        // non-dense ramps.
-        if (is_one(op->predicate) || op->predicate.as<Broadcast>() ||
-            !is_dense_ramp(op->index)) {
+        if (is_one(op->predicate)) {
+            // These are handled fine
             return IRMutator::visit(op);
         }
 
         Expr predicate = mutate(op->predicate);
         Expr index = mutate(op->index);
 
-        // Make the predicate into a scalar that is true if any of the lanes are
-        // true.
-        Expr condition = Shuffle::make({predicate}, {0});
-        for (int i = 1; i < op->type.lanes(); i++) {
-            condition = condition || Shuffle::make({predicate}, {i});
-        }
-        predicate = Broadcast::make(condition, predicate.type().lanes());
+        if (is_dense_ramp(index) || index.as<Broadcast>()) {
+            // Make the predicate into a scalar that is true if any of the lanes are
+            // true.
 
-        return Load::make(op->type, op->name, index, op->image, op->param,
-                          predicate, op->alignment);
+            Expr condition;
+
+            // If the predicate is monotonic increasing or decreasing
+            // over the vector lanes, we can just check the last or
+            // first lane, respectively. We won't bother to
+            // distinguish between the two cases though, so we just or
+            // them both together.
+            auto v = get_extreme_lanes(predicate);
+            if (v.first.defined()) {
+                internal_assert(v.first.type() == Bool() &&
+                                v.second.type() == Bool())
+                    << "The extreme lanes of a bool vector should be scalar bools\n";
+                condition = simplify(v.first || v.second);
+            } else {
+                // Take an OR over all lanes. Consider replacing this
+                // with a VectorReduce node once those are available
+                // and codegen to something useful on hexagon.
+                condition = Shuffle::make({predicate}, {0});
+                for (int i = 1; i < op->type.lanes(); i++) {
+                    condition = condition || Shuffle::make({predicate}, {i});
+                }
+                condition = simplify(condition);
+            }
+
+            Expr load = Load::make(op->type, op->name, index, op->image, op->param,
+                                   const_true(op->type.lanes()), op->alignment);
+
+            return Call::make(op->type, Call::if_then_else,
+                              {condition, load, make_zero(op->type)}, Call::Intrinsic);
+
+            return load;
+        } else {
+            // It's a predicated vector gather. Just scalarize. We'd
+            // prefer to keep it in a loop, but that would require
+            // some sort of loop Expr. Another option would be
+            // introducing a set of runtime functions to do predicated
+            // loads.
+            Expr load = Load::make(op->type, op->name, index, op->image, op->param,
+                                   const_true(op->type.lanes()), op->alignment);
+            return Call::make(op->type, Call::if_then_else,
+                              {predicate, load, make_zero(op->type)}, Call::Intrinsic);
+        }
     }
 
-    using IRMutator::visit;
+    Stmt visit(const Store *op) override {
+        if (is_one(op->predicate)) {
+            return IRMutator::visit(op);
+        }
+
+        Expr predicate = mutate(op->predicate);
+        Expr value = mutate(op->value);
+        Expr index = mutate(op->index);
+
+        int lanes = value.type().lanes();
+
+        if (const Broadcast *scalar_pred = predicate.as<Broadcast>()) {
+            Stmt unpredicated_store = Store::make(op->name, value, index, op->param, const_true(lanes), op->alignment);
+            return IfThenElse::make(scalar_pred->value, unpredicated_store);
+        } else {
+            string value_name = unique_name("scalarized_store_value");
+            string index_name = unique_name("scalarized_store_index");
+            string predicate_name = unique_name("scalarized_store_predicate");
+
+            const Ramp *index_ramp = index.as<Ramp>();
+
+            // Store entire vectors to the stack
+            vector<Stmt> stmts;
+            Expr predicate_mask = select(predicate, make_one(UInt(8, lanes)), make_zero(UInt(8, lanes)));
+            stmts.emplace_back(Store::make(predicate_name, predicate_mask, Ramp::make(0, 1, lanes),
+                                           Parameter(), const_true(lanes),
+                                           ModulusRemainder()));
+            stmts.emplace_back(Store::make(value_name, value, Ramp::make(0, 1, lanes),
+                                           Parameter(), const_true(lanes),
+                                           ModulusRemainder()));
+            if (!index_ramp) {
+                stmts.emplace_back(Store::make(index_name, index, Ramp::make(0, 1, lanes),
+                                               Parameter(), const_true(lanes),
+                                               ModulusRemainder()));
+            }
+
+            // Then load each element one by one in a loop and do a conditional scalar store
+            string lane_name = unique_name('t');
+            Expr lane_var = Variable::make(Int(32), lane_name);
+
+            Expr pred_i = Load::make(UInt(8), predicate_name, lane_var,
+                                     Buffer<>(), Parameter(), const_true(), ModulusRemainder());
+            Expr value_i = Load::make(value.type().element_of(), value_name, lane_var,
+                                      Buffer<>(), Parameter(), const_true(), ModulusRemainder());
+            Expr index_i;
+            if (index_ramp) {
+                index_i = index_ramp->base + lane_var * index_ramp->stride;
+            } else {
+                index_i = Load::make(Int(32), index_name, lane_var,
+                                     Buffer<>(), Parameter(), const_true(), ModulusRemainder());
+            }
+
+            Stmt store_lanes = Store::make(op->name, value_i, index_i,
+                                           op->param, const_true(),
+                                           ModulusRemainder());
+            store_lanes = IfThenElse::make(pred_i != 0, store_lanes);
+            store_lanes = For::make(lane_name, 0, lanes,
+                                    ForType::Serial, DeviceAPI::None, store_lanes);
+            stmts.emplace_back(std::move(store_lanes));
+
+            Stmt result = Block::make(stmts);
+
+            // Wrap with allocate nodes
+
+            result = Allocate::make(predicate_name, UInt(8), MemoryType::Stack,
+                                    {predicate.type().lanes()}, const_true(), result);
+            if (!index_ramp) {
+                result = Allocate::make(index_name, Int(32), MemoryType::Stack,
+                                        {index.type().lanes()}, const_true(), result);
+            }
+            result = Allocate::make(value_name, value.type().element_of(), MemoryType::Stack,
+                                    {value.type().lanes()}, const_true(), result);
+
+            return result;
+        }
+    }
 };
 
 Stmt sloppy_unpredicate_loads_and_stores(const Stmt &s) {
@@ -271,12 +428,10 @@ void CodeGen_Hexagon::compile_func(const LoweredFunc &f,
     Stmt body = f.body;
 
     debug(1) << "Unpredicating loads and stores...\n";
-    // Replace dense vector predicated loads and stores with
-    // scalarized versions. We can afford to be a little sloppy with
-    // the dense vector loads because on hexagon we can always read
-    // out of bounds by one vector.
+    // Replace dense vector predicated loads with sloppy scalarized
+    // predicates, and scalarize predicated stores
     body = sloppy_unpredicate_loads_and_stores(body);
-    body = unpredicate_loads_stores(body);
+
     debug(2) << "Lowering after unpredicating loads/stores:\n"
              << body << "\n\n";
 
@@ -1256,11 +1411,11 @@ Value *CodeGen_Hexagon::call_intrin_cast(llvm::Type *ret_ty, int id,
 Value *CodeGen_Hexagon::interleave_vectors(const vector<llvm::Value *> &v) {
     const bool is_128B = target.has_feature(Halide::Target::HVX_128);
     llvm::Type *v_ty = v[0]->getType();
-    llvm::Type *element_ty = v_ty->getVectorElementType();
+    llvm::Type *element_ty = get_vector_element_type(v_ty);
     int element_bits = element_ty->getScalarSizeInBits();
     int native_elements =
         native_vector_bits() / element_ty->getScalarSizeInBits();
-    int result_elements = v_ty->getVectorNumElements() * v.size();
+    int result_elements = get_vector_num_elements(v_ty) * v.size();
     if (v.size() == 2) {
         // Interleaving two vectors.
         Value *a = v[0];
@@ -1304,9 +1459,9 @@ Value *CodeGen_Hexagon::interleave_vectors(const vector<llvm::Value *> &v) {
         Value *lut = concat_vectors(v);
 
         std::vector<int> indices;
-        for (unsigned i = 0; i < v_ty->getVectorNumElements(); i++) {
+        for (int i = 0; i < get_vector_num_elements(v_ty); i++) {
             for (size_t j = 0; j < v.size(); j++) {
-                indices.push_back(j * v_ty->getVectorNumElements() + i);
+                indices.push_back(j * get_vector_num_elements(v_ty) + i);
             }
         }
 
@@ -1388,9 +1543,9 @@ Value *CodeGen_Hexagon::shuffle_vectors(Value *a, Value *b,
     internal_assert(a_ty == b_ty);
 
     const bool is_128B = target.has_feature(Halide::Target::HVX_128);
-    int a_elements = static_cast<int>(a_ty->getVectorNumElements());
+    int a_elements = static_cast<int>(get_vector_num_elements(a_ty));
 
-    llvm::Type *element_ty = a->getType()->getVectorElementType();
+    llvm::Type *element_ty = get_vector_element_type(a->getType());
     internal_assert(element_ty);
     int element_bits = element_ty->getScalarSizeInBits();
     int native_elements = native_vector_bits() / element_bits;
@@ -1470,7 +1625,7 @@ Value *CodeGen_Hexagon::shuffle_vectors(Value *a, Value *b,
                 native_ty, MAKE_ID_PAIR(Intrinsic::hexagon_V6_lo).get(is_128B), {a});
             a_ty = a->getType();
             b_ty = b->getType();
-            a_elements = a_ty->getVectorNumElements();
+            a_elements = get_vector_num_elements(a_ty);
         }
         if (start == 0 && result_ty == a_ty) {
             return a;
@@ -1581,7 +1736,7 @@ Value *CodeGen_Hexagon::vlut256(Value *lut, Value *idx, int min_index,
     // Split up the LUT into native vectors, using the max_index to
     // indicate how many we need.
     max_index =
-        std::min(max_index, static_cast<int>(lut_ty->getVectorNumElements()) - 1);
+        std::min(max_index, get_vector_num_elements(lut_ty) - 1);
     int native_idx_elements = native_vector_bits() / 8;
     int native_lut_elements =
         native_vector_bits() / lut_ty->getScalarSizeInBits();
@@ -1599,10 +1754,10 @@ Value *CodeGen_Hexagon::vlut256(Value *lut, Value *idx, int min_index,
     internal_assert(!lut_slices.empty());
 
     llvm::Type *native_result_ty = llvm::VectorType::get(
-        lut_ty->getVectorElementType(), native_idx_elements);
+        get_vector_element_type(lut_ty), native_idx_elements);
 
     // The result will have the same number of elements as idx.
-    int idx_elements = idx_ty->getVectorNumElements();
+    int idx_elements = get_vector_num_elements(idx_ty);
 
     // Each LUT has 1 pair of even/odd mask values for HVX 64, 2 for
     // HVX 128.  We may not need all of the passes, if the LUT has
@@ -1745,8 +1900,8 @@ bool generate_vdelta(const std::vector<int> &indices, bool reverse,
 Value *CodeGen_Hexagon::vdelta(Value *lut, const vector<int> &indices) {
     bool is_128B = target.has_feature(Halide::Target::HVX_128);
     llvm::Type *lut_ty = lut->getType();
-    int lut_elements = lut_ty->getVectorNumElements();
-    llvm::Type *element_ty = lut_ty->getVectorElementType();
+    int lut_elements = get_vector_num_elements(lut_ty);
+    llvm::Type *element_ty = get_vector_element_type(lut_ty);
     int element_bits = element_ty->getScalarSizeInBits();
     int native_elements =
         native_vector_bits() / element_ty->getScalarSizeInBits();
@@ -1860,10 +2015,11 @@ Value *CodeGen_Hexagon::vdelta(Value *lut, const vector<int> &indices) {
 static Value *create_vector(llvm::Type *ty, int val) {
     llvm::Type *scalar_ty = ty->getScalarType();
     Constant *value = ConstantInt::get(scalar_ty, val);
+    const int e = get_vector_num_elements(ty);
 #if LLVM_VERSION >= 110
-    const llvm::ElementCount elem_count(ty->getVectorNumElements(), /*scalable*/ false);
+    const llvm::ElementCount elem_count(e, /*scalable*/ false);
 #else
-    const int elem_count = ty->getVectorNumElements();
+    const int elem_count = e;
 #endif
     return ConstantVector::getSplat(elem_count, value);
 }
@@ -1873,9 +2029,9 @@ Value *CodeGen_Hexagon::vlut(Value *lut, Value *idx, int min_index, int max_inde
     internal_assert(idx_elem_size <= 16)
         << "Index element for lookup tables must be <= 16 bits in size.\n";
     llvm::Type *lut_ty = lut->getType();
-    llvm::Type *result_ty = VectorType::get(lut_ty->getVectorElementType(),
-                                            idx->getType()->getVectorNumElements());
-    const unsigned idx_elems = idx->getType()->getVectorNumElements();
+    llvm::Type *result_ty = VectorType::get(get_vector_element_type(lut_ty),
+                                            get_vector_num_elements(idx->getType()));
+    const unsigned idx_elems = get_vector_num_elements(idx->getType());
 
     // Construct a new index with 16-bit elements.
     unsigned idx16_elems = idx_elems;
@@ -1907,7 +2063,7 @@ Value *CodeGen_Hexagon::vlut(Value *lut, Value *idx, int min_index, int max_inde
         internal_assert(max_index <= 32676)
             << "Index range for lookup table must be <= 32676\n";
         lut_ty = VectorType::get(i16_t,
-                                 lut_ty->getVectorNumElements() * replicate);
+                                 get_vector_num_elements(lut_ty) * replicate);
         lut = builder->CreateBitCast(lut, lut_ty);
     }
 
@@ -1973,7 +2129,7 @@ Value *CodeGen_Hexagon::vlut(Value *lut, const vector<int> &indices) {
     // at compile time.
     vector<Constant *> llvm_indices;
     llvm_indices.reserve(indices.size());
-    int min_index = lut->getType()->getVectorNumElements();
+    int min_index = get_vector_num_elements(lut->getType());
     int max_index = 0;
     for (int i : indices) {
         if (i != -1) {
@@ -2045,8 +2201,8 @@ Value *CodeGen_Hexagon::call_intrin(Type result_type, const string &name,
     llvm::Function *fn = module->getFunction(name);
     if (maybe && !fn) return nullptr;
     internal_assert(fn) << "Function '" << name << "' not found\n";
-    if (fn->getReturnType()->getVectorNumElements() * 2 <=
-        static_cast<unsigned>(result_type.lanes())) {
+    if (get_vector_num_elements(fn->getReturnType()) * 2 <=
+        result_type.lanes()) {
         // We have fewer than half as many lanes in our intrinsic as
         // we have in the call. Check to see if a double vector
         // version of this intrinsic exists.
@@ -2055,7 +2211,7 @@ Value *CodeGen_Hexagon::call_intrin(Type result_type, const string &name,
             fn = fn2;
         }
     }
-    return call_intrin(result_type, fn->getReturnType()->getVectorNumElements(),
+    return call_intrin(result_type, get_vector_num_elements(fn->getReturnType()),
                        get_llvm_function_name(fn), std::move(args));
 }
 
@@ -2064,8 +2220,8 @@ Value *CodeGen_Hexagon::call_intrin(llvm::Type *result_type, const string &name,
     llvm::Function *fn = module->getFunction(name);
     if (maybe && !fn) return nullptr;
     internal_assert(fn) << "Function '" << name << "' not found\n";
-    if (fn->getReturnType()->getVectorNumElements() * 2 <=
-        result_type->getVectorNumElements()) {
+    if (get_vector_num_elements(fn->getReturnType()) * 2 <=
+        get_vector_num_elements(result_type)) {
         // We have fewer than half as many lanes in our intrinsic as
         // we have in the call. Check to see if a double vector
         // version of this intrinsic exists.
@@ -2074,7 +2230,7 @@ Value *CodeGen_Hexagon::call_intrin(llvm::Type *result_type, const string &name,
             fn = fn2;
         }
     }
-    return call_intrin(result_type, fn->getReturnType()->getVectorNumElements(),
+    return call_intrin(result_type, get_vector_num_elements(fn->getReturnType()),
                        get_llvm_function_name(fn), std::move(args));
 }
 

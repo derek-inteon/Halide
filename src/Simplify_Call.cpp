@@ -151,7 +151,9 @@ Expr Simplify::visit(const Call *op, ExprInfo *bounds) {
 
             // LLVM shl and shr instructions produce poison for
             // shifts >= typesize, so we will follow suit in our simplifier.
-            user_assert(ub < (uint64_t)t.bits()) << "bitshift by a constant amount >= the type size is not legal in Halide.";
+            if (ub >= (uint64_t)(t.bits())) {
+                return make_signed_integer_overflow(t);
+            }
             if (a.type().is_uint() || ub < ((uint64_t)t.bits() - 1)) {
                 b = make_const(t, ((int64_t)1LL) << ub);
                 if (shift_left) {
@@ -493,6 +495,16 @@ Expr Simplify::visit(const Call *op, ExprInfo *bounds) {
             return Call::make(op->type, op->name,
                               {arg, lower, upper},
                               Call::Intrinsic);
+        }
+    } else if (op->is_intrinsic(Call::likely) ||
+               op->is_intrinsic(Call::likely_if_innermost)) {
+        // The bounds of the result are the bounds of the arg
+        internal_assert(op->args.size() == 1);
+        Expr arg = mutate(op->args[0], bounds);
+        if (arg.same_as(op->args[0])) {
+            return op;
+        } else {
+            return Call::make(op->type, op->name, {arg}, op->call_type);
         }
     } else if (op->call_type == Call::PureExtern) {
         // TODO: This could probably be simplified into a single map-lookup

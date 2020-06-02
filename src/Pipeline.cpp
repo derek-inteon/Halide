@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <utility>
 
 #include "Argument.h"
@@ -7,7 +8,6 @@
 #include "Func.h"
 #include "IRVisitor.h"
 #include "InferArguments.h"
-#include "LLVM_Headers.h"
 #include "LLVM_Output.h"
 #include "Lower.h"
 #include "Module.h"
@@ -800,7 +800,7 @@ namespace {
 struct ErrorBuffer {
     enum { MaxBufSize = 4096 };
     char buf[MaxBufSize];
-    int end;
+    std::atomic<size_t> end;
 
     ErrorBuffer() {
         end = 0;
@@ -815,11 +815,7 @@ struct ErrorBuffer {
         }
 
         // Atomically claim some space in the buffer
-#ifdef _MSC_VER
-        int old_end = _InterlockedExchangeAdd((volatile long *)(&end), len);
-#else
-        int old_end = __sync_fetch_and_add(&end, len);
-#endif
+        size_t old_end = end.fetch_add(len);
 
         if (old_end + len >= MaxBufSize - 1) {
             // Out of space

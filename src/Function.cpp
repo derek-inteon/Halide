@@ -5,13 +5,13 @@
 #include <utility>
 
 #include "CSE.h"
+#include "Func.h"
 #include "Function.h"
 #include "IR.h"
 #include "IREquality.h"
 #include "IRMutator.h"
 #include "IROperator.h"
 #include "IRPrinter.h"
-#include "Introspection.h"
 #include "ParallelRVar.h"
 #include "Random.h"
 #include "Scope.h"
@@ -396,14 +396,14 @@ void Function::define(const vector<string> &args, vector<Expr> values) {
     // attached to some parameter
     CheckVars check(name());
     check.pure_args = args;
-    for (size_t i = 0; i < values.size(); i++) {
-        values[i].accept(&check);
+    for (const auto &value : values) {
+        value.accept(&check);
     }
 
     // Freeze all called functions
     FreezeFunctions freezer(name());
-    for (size_t i = 0; i < values.size(); i++) {
-        values[i].accept(&freezer);
+    for (const auto &value : values) {
+        value.accept(&freezer);
     }
 
     // Make sure all the vars in the args have unique non-empty names
@@ -421,14 +421,19 @@ void Function::define(const vector<string> &args, vector<Expr> values) {
         }
     }
 
-    for (size_t i = 0; i < values.size(); i++) {
-        values[i] = common_subexpression_elimination(values[i]);
+    for (auto &value : values) {
+        value = common_subexpression_elimination(value);
     }
 
     // Tag calls to random() with the free vars
     int tag = rand_counter++;
-    for (size_t i = 0; i < values.size(); i++) {
-        values[i] = lower_random(values[i], args, tag);
+    vector<VarOrRVar> free_vars;
+    free_vars.reserve(args.size());
+    for (const auto &arg : args) {
+        free_vars.emplace_back(Var(arg));
+    }
+    for (auto &value : values) {
+        value = lower_random(value, free_vars, tag);
     }
 
     user_assert(!check.reduction_domain.defined())
@@ -458,7 +463,7 @@ void Function::define(const vector<string> &args, vector<Expr> values) {
     contents->init_def = Definition(init_def_args, values, rdom, true);
 
     for (size_t i = 0; i < args.size(); i++) {
-        Dim d = {args[i], ForType::Serial, DeviceAPI::None, Dim::Type::PureVar};
+        Dim d = {args[i], ForType::Serial, DeviceAPI::None, DimType::PureVar};
         contents->init_def.schedule().dims().push_back(d);
         StorageDim sd = {args[i]};
         contents->func_schedule.storage_dims().push_back(sd);
@@ -466,7 +471,7 @@ void Function::define(const vector<string> &args, vector<Expr> values) {
 
     // Add the dummy outermost dim
     {
-        Dim d = {Var::outermost().name(), ForType::Serial, DeviceAPI::None, Dim::Type::PureVar};
+        Dim d = {Var::outermost().name(), ForType::Serial, DeviceAPI::None, DimType::PureVar};
         contents->init_def.schedule().dims().push_back(d);
     }
 
@@ -568,11 +573,11 @@ void Function::define_update(const vector<Expr> &_args, vector<Expr> values) {
     // vars in the LHS in the correct places.
     CheckVars check(name());
     check.pure_args = pure_args;
-    for (size_t i = 0; i < args.size(); i++) {
-        args[i].accept(&check);
+    for (const auto &arg : args) {
+        arg.accept(&check);
     }
-    for (size_t i = 0; i < values.size(); i++) {
-        values[i].accept(&check);
+    for (const auto &value : values) {
+        value.accept(&check);
     }
     if (check.reduction_domain.defined()) {
         check.unbound_reduction_vars_ok = true;
@@ -581,11 +586,11 @@ void Function::define_update(const vector<Expr> &_args, vector<Expr> values) {
 
     // Freeze all called functions
     FreezeFunctions freezer(name());
-    for (size_t i = 0; i < args.size(); i++) {
-        args[i].accept(&freezer);
+    for (const auto &arg : args) {
+        arg.accept(&freezer);
     }
-    for (size_t i = 0; i < values.size(); i++) {
-        values[i].accept(&freezer);
+    for (const auto &value : values) {
+        value.accept(&freezer);
     }
 
     // Freeze the reduction domain if defined
@@ -595,24 +600,28 @@ void Function::define_update(const vector<Expr> &_args, vector<Expr> values) {
     }
 
     // Tag calls to random() with the free vars
-    vector<string> free_vars;
-    for (size_t i = 0; i < pure_args.size(); i++) {
-        if (!pure_args[i].empty()) {
-            free_vars.push_back(pure_args[i]);
+    vector<VarOrRVar> free_vars;
+    int num_free_vars = (int)pure_args.size();
+    if (check.reduction_domain.defined()) {
+        num_free_vars += (int)check.reduction_domain.domain().size();
+    }
+    free_vars.reserve(num_free_vars);
+    for (const auto &pure_arg : pure_args) {
+        if (!pure_arg.empty()) {
+            free_vars.emplace_back(Var(pure_arg));
         }
     }
     if (check.reduction_domain.defined()) {
         for (size_t i = 0; i < check.reduction_domain.domain().size(); i++) {
-            string rvar = check.reduction_domain.domain()[i].var;
-            free_vars.push_back(rvar);
+            free_vars.emplace_back(RVar(check.reduction_domain, i));
         }
     }
     int tag = rand_counter++;
-    for (size_t i = 0; i < args.size(); i++) {
-        args[i] = lower_random(args[i], free_vars, tag);
+    for (auto &arg : args) {
+        arg = lower_random(arg, free_vars, tag);
     }
-    for (size_t i = 0; i < values.size(); i++) {
-        values[i] = lower_random(values[i], free_vars, tag);
+    for (auto &value : values) {
+        value = lower_random(value, free_vars, tag);
     }
     if (check.reduction_domain.defined()) {
         check.reduction_domain.set_predicate(lower_random(check.reduction_domain.predicate(), free_vars, tag));
@@ -622,11 +631,11 @@ void Function::define_update(const vector<Expr> &_args, vector<Expr> values) {
     // function itself, introducing circular references and hence
     // memory leaks. We need to break these cycles.
     WeakenFunctionPtrs weakener(contents.get());
-    for (size_t i = 0; i < args.size(); i++) {
-        args[i] = weakener.mutate(args[i]);
+    for (auto &arg : args) {
+        arg = weakener.mutate(arg);
     }
-    for (size_t i = 0; i < values.size(); i++) {
-        values[i] = weakener.mutate(values[i]);
+    for (auto &value : values) {
+        value = weakener.mutate(value);
     }
     if (check.reduction_domain.defined()) {
         check.reduction_domain.set_predicate(
@@ -648,22 +657,22 @@ void Function::define_update(const vector<Expr> &_args, vector<Expr> values) {
 
             bool pure = can_parallelize_rvar(v, name(), r);
             Dim d = {v, ForType::Serial, DeviceAPI::None,
-                     pure ? Dim::Type::PureRVar : Dim::Type::ImpureRVar};
+                     pure ? DimType::PureRVar : DimType::ImpureRVar};
             r.schedule().dims().push_back(d);
         }
     }
 
     // Then add the pure args outside of that
-    for (size_t i = 0; i < pure_args.size(); i++) {
-        if (!pure_args[i].empty()) {
-            Dim d = {pure_args[i], ForType::Serial, DeviceAPI::None, Dim::Type::PureVar};
+    for (const auto &pure_arg : pure_args) {
+        if (!pure_arg.empty()) {
+            Dim d = {pure_arg, ForType::Serial, DeviceAPI::None, DimType::PureVar};
             r.schedule().dims().push_back(d);
         }
     }
 
     // Then the dummy outermost dim
     {
-        Dim d = {Var::outermost().name(), ForType::Serial, DeviceAPI::None, Dim::Type::PureVar};
+        Dim d = {Var::outermost().name(), ForType::Serial, DeviceAPI::None, DimType::PureVar};
         r.schedule().dims().push_back(d);
     }
 
@@ -733,11 +742,11 @@ void Function::define_extern(const std::string &function_name,
     for (size_t i = 0; i < args.size(); i++) {
         contents->func_schedule.storage_dims().push_back(StorageDim{arg_names[i]});
         contents->init_def.schedule().dims().push_back(
-            Dim{arg_names[i], ForType::Extern, DeviceAPI::None, Dim::Type::PureVar});
+            Dim{arg_names[i], ForType::Extern, DeviceAPI::None, DimType::PureVar});
     }
     // Add the dummy outermost dim
     contents->init_def.schedule().dims().push_back(
-        Dim{Var::outermost().name(), ForType::Serial, DeviceAPI::None, Dim::Type::PureVar});
+        Dim{Var::outermost().name(), ForType::Serial, DeviceAPI::None, DimType::PureVar});
 }
 
 void Function::accept(IRVisitor *visitor) const {
@@ -891,6 +900,10 @@ const std::string &Function::debug_file() const {
 
 std::string &Function::debug_file() {
     return contents->debug_file;
+}
+
+Function::operator ExternFuncArgument() const {
+    return ExternFuncArgument(contents);
 }
 
 void Function::trace_loads() {

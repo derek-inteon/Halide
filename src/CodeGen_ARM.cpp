@@ -780,11 +780,7 @@ void CodeGen_ARM::visit(const Store *op) {
             arg_types.back() = llvm_type_of(intrin_type.element_of())->getPointerTo();
         }
         llvm::FunctionType *fn_type = FunctionType::get(llvm::Type::getVoidTy(*context), arg_types, false);
-#if LLVM_VERSION >= 90
         llvm::FunctionCallee fn = module->getOrInsertFunction(instr.str(), fn_type);
-#else
-        llvm::Function *fn = dyn_cast_or_null<llvm::Function>(module->getOrInsertFunction(instr.str(), fn_type));
-#endif
         internal_assert(fn);
 
         // How many vst instructions do we need to generate?
@@ -953,7 +949,9 @@ void CodeGen_ARM::visit(const Load *op) {
             Value *ptr = codegen_buffer_pointer(op->name, op->type.element_of(), slice_base);
             Value *bitcastI = builder->CreateBitOrPointerCast(ptr, load_return_pointer_type);
             LoadInst *loadI = cast<LoadInst>(builder->CreateLoad(bitcastI));
-#if LLVM_VERSION >= 100
+#if LLVM_VERSION >= 110
+            loadI->setAlignment(Align(alignment));
+#elif LLVM_VERSION >= 100
             loadI->setAlignment(MaybeAlign(alignment));
 #else
             loadI->setAlignment(alignment);

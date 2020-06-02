@@ -1,5 +1,7 @@
 #include "BoundsInference.h"
 #include "Bounds.h"
+#include "ExternFuncArgument.h"
+#include "Function.h"
 #include "IREquality.h"
 #include "IRMutator.h"
 #include "IROperator.h"
@@ -183,7 +185,7 @@ public:
     // The fused group is indexed in the same way as 'fused_groups'.
     const vector<set<FusedPair>> &fused_pairs_in_groups;
     const FuncValueBounds &func_bounds;
-    set<string> in_pipeline, inner_productions;
+    set<string> in_pipeline, inner_productions, has_extern_consumer;
     const Target target;
 
     struct CondValue {
@@ -378,6 +380,7 @@ public:
                            const vector<set<FusedPair>> &fused_pairs_in_groups,
                            const set<string> &in_pipeline,
                            const set<string> &inner_productions,
+                           const set<string> &has_extern_consumer,
                            const Target &target) {
 
             // Merge all the relevant boxes.
@@ -568,12 +571,31 @@ public:
             for (size_t d = 0; d < b.size(); d++) {
                 string arg = name + ".s" + std::to_string(stage) + "." + func_args[d];
 
+                const bool clamp_to_outer_bounds =
+                    !in_pipeline.empty() && has_extern_consumer.count(name);
+                if (clamp_to_outer_bounds) {
+                    // Allocation bounds inference is going to have a
+                    // bad time lifting the results of the bounds
+                    // queries outwards. Help it out by insisting that
+                    // the bounds are clamped to lie within the bounds
+                    // one loop level up.
+                    Expr outer_min = Variable::make(Int(32), arg + ".outer_min");
+                    Expr outer_max = Variable::make(Int(32), arg + ".outer_max");
+                    b[d].min = clamp(b[d].min, outer_min, outer_max);
+                    b[d].max = clamp(b[d].max, outer_min, outer_max);
+                }
+
                 if (b[d].is_single_point()) {
                     s = LetStmt::make(arg + ".min", Variable::make(Int(32), arg + ".max"), s);
                 } else {
                     s = LetStmt::make(arg + ".min", b[d].min, s);
                 }
                 s = LetStmt::make(arg + ".max", b[d].max, s);
+
+                if (clamp_to_outer_bounds) {
+                    s = LetStmt::make(arg + ".outer_min", Variable::make(Int(32), arg + ".min"), s);
+                    s = LetStmt::make(arg + ".outer_max", Variable::make(Int(32), arg + ".max"), s);
+                }
             }
 
             if (stage > 0) {
@@ -861,6 +883,7 @@ public:
                 for (size_t j = 0; j < args.size(); j++) {
                     if (args[j].is_func()) {
                         Function f(args[j].func);
+                        has_extern_consumer.insert(f.name());
                         string stage_name = f.name() + ".s" + std::to_string(f.updates().size());
                         Box b(f.dimensions());
                         for (int d = 0; d < f.dimensions(); d++) {
@@ -1045,6 +1068,7 @@ public:
         // because e.g. B could be double-resolution (as happens when fusing yuv computations), so this
         // is not just a matter of giving A's box B's name as an alias.
         map<string, Box> boxes_for_fused_group;
+        map<string, Function> stage_name_to_func;
         if (!no_pipelines && producing >= 0 && !f.has_extern_definition()) {
             Scope<Interval> empty_scope;
             size_t last_dot = op->name.rfind('.');
@@ -1066,13 +1090,22 @@ public:
 
             if (fused_with_f.empty()) {
                 boxes_for_fused_group[stage_name] = box_provided(body, stages[producing].name, empty_scope, func_bounds);
+                stage_name_to_func[stage_name] = f;
                 internal_assert((int)boxes_for_fused_group[stage_name].size() == f.dimensions());
             } else {
                 auto boxes = boxes_provided(body, empty_scope, func_bounds);
                 boxes_for_fused_group[stage_name] = boxes[stages[producing].name];
-
+                stage_name_to_func[stage_name] = f;
+                internal_assert((int)boxes_for_fused_group[stage_name].size() == f.dimensions());
                 for (const auto &fused : fused_with_f) {
-                    boxes_for_fused_group[fused.first + ".s" + std::to_string(fused.second)] = boxes[fused.first];
+                    string fused_stage_name = fused.first + ".s" + std::to_string(fused.second);
+                    boxes_for_fused_group[fused_stage_name] = boxes[fused.first];
+                    for (const auto &fn : funcs) {
+                        if (fn.name() == fused.first) {
+                            stage_name_to_func[fused_stage_name] = fn;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1101,16 +1134,18 @@ public:
                     }
                     body = stages[i].define_bounds(
                         body, f, stage_name, stage_index, op->name, fused_groups,
-                        fused_pairs_in_groups, in_pipeline, inner_productions, target);
+                        fused_pairs_in_groups, in_pipeline, inner_productions,
+                        has_extern_consumer, target);
                 }
             }
 
             // Finally, define the production bounds for the thing
             // we're producing.
             if (producing >= 0 && !inner_productions.empty()) {
-                const vector<string> &f_args = f.args();
                 for (const auto &b : boxes_for_fused_group) {
+                    const vector<string> &f_args = stage_name_to_func[b.first].args();
                     const auto &box = b.second;
+                    internal_assert(f_args.size() == box.size());
                     for (size_t i = 0; i < box.size(); i++) {
                         internal_assert(box[i].is_bounded());
                         string var = b.first + "." + f_args[i];
@@ -1236,8 +1271,14 @@ Stmt bounds_inference(Stmt s,
         fused_pairs_in_groups.push_back(pairs);
     }
 
-    // Add an outermost bounds inference marker
+    // Add a note in the IR for where assertions on input images
+    // should go. Those are handled by a later lowering pass.
+    Expr marker = Call::make(Int(32), Call::add_image_checks_marker, {}, Call::Intrinsic);
+    s = Block::make(Evaluate::make(marker), s);
+
+    // Add a synthetic outermost loop to act as 'root'.
     s = For::make("<outermost>", 0, 1, ForType::Serial, DeviceAPI::None, s);
+
     s = BoundsInference(funcs, fused_func_groups, fused_pairs_in_groups,
                         outputs, func_bounds, target)
             .mutate(s);

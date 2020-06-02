@@ -317,15 +317,28 @@ class MonotonicVisitor : public IRVisitor {
             return;
         }
 
+        if (op->is_intrinsic(Call::unsafe_promise_clamped) ||
+            op->is_intrinsic(Call::promise_clamped)) {
+            op->args[0].accept(this);
+            return;
+        }
+
         if (op->is_intrinsic(Call::require)) {
             // require() returns the value of the second arg in all non-failure cases
             op->args[1].accept(this);
             return;
         }
 
+        if (!op->is_pure()) {
+            // Even with constant args, the result could vary from one loop iteration to the next.
+            result = Monotonic::Unknown;
+            return;
+        }
+
         for (size_t i = 0; i < op->args.size(); i++) {
             op->args[i].accept(this);
             if (result != Monotonic::Constant) {
+                // One of the args is not constant.
                 result = Monotonic::Unknown;
                 return;
             }
@@ -501,6 +514,9 @@ void is_monotonic_test() {
     check_unknown(x == y);
     check_unknown(x != y);
     check_unknown(x * y);
+
+    // Not constant despite having constant args, because there's a side-effect.
+    check_unknown(Call::make(Int(32), "foo", {Expr(3)}, Call::Extern));
 
     check_increasing(select(y == 2, x, x + 4));
     check_decreasing(select(y == 2, -x, x * -4));

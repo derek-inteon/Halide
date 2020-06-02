@@ -9,6 +9,7 @@
 #include "CodeGen_OpenGL_Dev.h"
 #include "CodeGen_PTX_Dev.h"
 #include "Debug.h"
+#include "DeviceArgument.h"
 #include "ExprUsesVar.h"
 #include "IROperator.h"
 #include "IRPrinter.h"
@@ -85,9 +86,9 @@ private:
         user_assert(!allocate->new_expr.defined()) << "Allocate node inside GPU kernel has custom new expression.\n"
                                                    << "(Memoization is not supported inside GPU kernels at present.)\n";
 
-        if (allocate->name == "__shared") {
-            internal_assert(allocate->type == UInt(8) && allocate->extents.size() == 1);
-            shared_mem_size = allocate->extents[0];
+        if (allocate->memory_type == MemoryType::GPUShared) {
+            internal_assert(allocate->extents.size() == 1);
+            shared_mem_size += allocate->extents[0] * allocate->type.bytes();
             found_shared = true;
         }
         allocate->body.accept(this);
@@ -205,7 +206,7 @@ void CodeGen_GPU_Host<CodeGen_CPU>::compile_func(const LoweredFunc &f,
         Value *user_context = get_user_context();
         Value *kernel_size = ConstantInt::get(i32_t, kernel_src.size());
         std::string init_kernels_name = "halide_" + api_unique_name + "_initialize_kernels";
-        Value *init = module->getFunction(init_kernels_name);
+        llvm::Function *init = module->getFunction(init_kernels_name);
         internal_assert(init) << "Could not find function " + init_kernels_name + " in initial module\n";
         vector<Value *> init_kernels_args = {user_context, module_state, kernel_src_ptr, kernel_size};
         Value *result = builder->CreateCall(init, init_kernels_args);

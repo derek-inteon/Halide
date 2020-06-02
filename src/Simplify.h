@@ -5,9 +5,10 @@
  * Methods for simplifying halide statements and expressions
  */
 
-#include "Bounds.h"
-#include "IR.h"
+#include "Expr.h"
+#include "Interval.h"
 #include "ModulusRemainder.h"
+#include "Scope.h"
 
 namespace Halide {
 namespace Internal {
@@ -19,10 +20,10 @@ namespace Internal {
  * repeated variable names.
  */
 // @{
-Stmt simplify(const Stmt &, bool remove_dead_lets = true,
+Stmt simplify(const Stmt &, bool remove_dead_let_stmts = true,
               const Scope<Interval> &bounds = Scope<Interval>::empty_scope(),
               const Scope<ModulusRemainder> &alignment = Scope<ModulusRemainder>::empty_scope());
-Expr simplify(const Expr &, bool remove_dead_lets = true,
+Expr simplify(const Expr &, bool remove_dead_let_stmts = true,
               const Scope<Interval> &bounds = Scope<Interval>::empty_scope(),
               const Scope<ModulusRemainder> &alignment = Scope<ModulusRemainder>::empty_scope());
 // @}
