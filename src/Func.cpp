@@ -1111,14 +1111,14 @@ Stage &Stage::fuse(const VarOrRVar &inner, const VarOrRVar &outer, const VarOrRV
             fused_name = inner_name + "." + fused.name();
             dims[i].var = fused_name;
 
-            if (dims[i].dim_type == Dim::Type::ImpureRVar ||
-                outer_type == Dim::Type::ImpureRVar) {
-                dims[i].dim_type = Dim::Type::ImpureRVar;
-            } else if (dims[i].dim_type == Dim::Type::PureRVar ||
-                       outer_type == Dim::Type::PureRVar) {
-                dims[i].dim_type = Dim::Type::PureRVar;
+            if (dims[i].dim_type == DimType::ImpureRVar ||
+                outer_type == DimType::ImpureRVar) {
+                dims[i].dim_type = DimType::ImpureRVar;
+            } else if (dims[i].dim_type == DimType::PureRVar ||
+                       outer_type == DimType::PureRVar) {
+                dims[i].dim_type = DimType::PureRVar;
             } else {
-                dims[i].dim_type = Dim::Type::PureVar;
+                dims[i].dim_type = DimType::PureVar;
             }
         }
     }
