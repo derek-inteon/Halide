@@ -1672,6 +1672,10 @@ struct VectorReduceOp {
 
     constexpr static uint32_t binds = bindings<A>::mask;
 
+    constexpr static IRNodeType min_node_type = IRNodeType::VectorReduce;
+    constexpr static IRNodeType max_node_type = IRNodeType::VectorReduce;
+    constexpr static bool canonical = A::canonical;
+
     template<uint32_t bound>
     HALIDE_ALWAYS_INLINE bool match(const BaseExprNode &e, MatcherState &state) const noexcept {
         if (e.node_type == VectorReduce::_node_type) {
