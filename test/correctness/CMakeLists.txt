@@ -66,6 +66,7 @@ tests(GROUPS correctness
       convolution.cpp
       convolution_multiple_kernels.cpp
       cross_compilation.cpp
+      cuda_8_bit_dot_product.cpp
       custom_allocator.cpp
       custom_auto_scheduler.cpp
       custom_error_reporter.cpp
@@ -322,6 +323,7 @@ tests(GROUPS correctness
       vector_extern.cpp
       vector_math.cpp
       vector_print_bug.cpp
+      vector_reductions.cpp
       vectorize_guard_with_if.cpp
       vectorize_mixed_widths.cpp
       vectorize_varying_allocation_size.cpp
