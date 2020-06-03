@@ -133,7 +133,11 @@ class SplitTuples : public IRMutator {
     Stmt visit_provide(const Provide *op, const Atomic *atomic = nullptr) {
 
         if (op->values.size() == 1) {
-            return IRMutator::visit(op);
+            if (atomic) {
+                return IRMutator::visit(atomic);
+            } else {
+                return IRMutator::visit(op);
+            }
         }
 
         // Mutate the args
@@ -186,9 +190,11 @@ class SplitTuples : public IRMutator {
         // Build clusters of tuple components where two components
         // share a cluster if there is cross-talk between them.
         vector<vector<int>> clusters;
+        // Reserve space so that we can use pointers to clusters.
+        clusters.reserve(op->values.size());
         for (int i = 0; i < (int)op->values.size(); i++) {
-            // Does it belong to an existing cluster?
-            bool inserted_into_a_cluster = false;
+            // What clusters does it already belong to?
+            vector<int> *owning_cluster = nullptr;
             for (auto &c : clusters) {
                 bool belongs_to_this_cluster = false;
                 for (int j : c) {
@@ -199,12 +205,17 @@ class SplitTuples : public IRMutator {
                     }
                 }
                 if (belongs_to_this_cluster) {
-                    inserted_into_a_cluster = true;
-                    c.push_back(i);
-                    break;
+                    if (owning_cluster) {
+                        // It's already in a cluster! We need to merge the clusters.
+                        owning_cluster->insert(owning_cluster->end(), c.begin(), c.end());
+                        c.clear();
+                    } else {
+                        owning_cluster = &c;
+                        c.push_back(i);
+                    }
                 }
             }
-            if (!inserted_into_a_cluster) {
+            if (!owning_cluster) {
                 // Make a new cluster
                 clusters.push_back(vector<int>{});
                 clusters.back().push_back(i);
@@ -214,7 +225,11 @@ class SplitTuples : public IRMutator {
         // For each cluster, build a list of scalar provide
         // statements, and a list of lets to wrap them.
         vector<Stmt> result;
-        for (const auto &c : clusters) {
+        for (auto &c : clusters) {
+            if (c.empty()) {
+                continue;
+            }
+            std::sort(c.begin(), c.end());
             vector<Stmt> provides;
             vector<pair<string, Expr>> lets;
 
@@ -229,14 +244,14 @@ class SplitTuples : public IRMutator {
                     string name = op->name + "." + std::to_string(i);
                     string var_name = name + ".value";
                     Expr val = mutate(op->values[i]);
-                    if (!is_undef(val) && atomic) {
+                    if (!is_undef(val)) {
                         lets.emplace_back(var_name, val);
                         val = Variable::make(val.type(), var_name);
                     }
                     provides.push_back(Provide::make(name, {val}, args));
                 }
 
-                Stmt s = Block::make(provides);
+                s = Block::make(provides);
 
                 while (!lets.empty()) {
                     auto p = lets.back();
@@ -249,6 +264,7 @@ class SplitTuples : public IRMutator {
                 s = Atomic::make(atomic->producer_name, atomic->mutex_name, s);
             }
 
+            internal_assert(s.defined());
             result.push_back(s);
         }
 
