@@ -1457,6 +1457,66 @@ public:
     }
 };
 
+/** Check if all stores in a Stmt are to names in a given scope. Used
+    by RemoveUnnecessaryAtomics below. */
+class AllStoresInScope : public IRVisitor {
+    using IRVisitor::visit;
+    void visit(const Store *op) override {
+        debug(0) << op->name << " is local: " << s.contains(op->name) << "\n";
+        result = result && s.contains(op->name);
+    }
+
+public:
+    bool result = true;
+    const Scope<> &s;
+    AllStoresInScope(const Scope<> &s)
+        : s(s) {
+    }
+};
+bool all_stores_in_scope(const Stmt &stmt, const Scope<> &scope) {
+    AllStoresInScope checker(scope);
+    stmt.accept(&checker);
+    return checker.result;
+}
+
+/** Drop any atomic nodes protecting buffers that are only accessed
+ * from a single thread. */
+class RemoveUnnecessaryAtomics : public IRMutator {
+    using IRMutator::visit;
+
+    // Allocations made from within this same thread
+    bool in_thread = false;
+    Scope<> local_allocs;
+
+    Stmt visit(const Allocate *op) override {
+        debug(0) << "Adding " << op->name << " to scope\n";
+        ScopedBinding<> bind(local_allocs, op->name);
+        return IRMutator::visit(op);
+    }
+
+    Stmt visit(const Atomic *op) override {
+        if (!in_thread || all_stores_in_scope(op->body, local_allocs)) {
+            return mutate(op->body);
+        } else {
+            return op;
+        }
+    }
+
+    Stmt visit(const For *op) override {
+        if (is_parallel(op->for_type)) {
+            ScopedValue<bool> old_in_thread(in_thread, true);
+            debug(0) << "Entering parallel loop: " << op->name << "\n";
+            Scope<> old_local_allocs;
+            std::swap(old_local_allocs, local_allocs);
+            Stmt s = IRMutator::visit(op);
+            std::swap(old_local_allocs, local_allocs);
+            return s;
+        } else {
+            return IRMutator::visit(op);
+        }
+    }
+};
+
 }  // namespace
 
 Stmt vectorize_loops(const Stmt &stmt, const map<string, Function> &env, const Target &t) {
@@ -1465,7 +1525,7 @@ Stmt vectorize_loops(const Stmt &stmt, const map<string, Function> &env, const T
     // for non-vectorizing stuff too.
     Stmt s = LiftVectorizableExprsOutOfAllAtomicNodes(env).mutate(stmt);
     s = VectorizeLoops(t).mutate(s);
-    // TODO: Some of the new atomic nodes aren't actually necessary
+    s = RemoveUnnecessaryAtomics().mutate(s);
     return s;
 }
 
