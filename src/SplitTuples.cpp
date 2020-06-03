@@ -157,7 +157,7 @@ class SplitTuples : public IRMutator {
         for (int i = 0; i < (int)op->values.size(); i++) {
             class Checker : public IRVisitor {
                 using IRVisitor::visit;
-                void visit(const Call *op) {
+                void visit(const Call *op) override {
                     if (op->call_type == Call::Halide &&
                         op->name == func_name &&
                         could_alias(op->args, store_args)) {
@@ -217,7 +217,7 @@ class SplitTuples : public IRMutator {
             }
             if (!owning_cluster) {
                 // Make a new cluster
-                clusters.push_back(vector<int>{});
+                clusters.emplace_back();
                 clusters.back().push_back(i);
             }
         }
