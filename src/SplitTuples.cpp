@@ -1,9 +1,11 @@
 #include "SplitTuples.h"
 
 #include "Bounds.h"
+#include "ExprUsesVar.h"
 #include "Function.h"
 #include "IRMutator.h"
 #include "IROperator.h"
+#include "Simplify.h"
 
 namespace Halide {
 namespace Internal {
@@ -68,7 +70,9 @@ class SplitTuples : public IRMutator {
             // Make a nested set of realize nodes for each tuple element
             Stmt body = mutate(op->body);
             for (int i = (int)op->types.size() - 1; i >= 0; i--) {
-                body = Realize::make(op->name + "." + std::to_string(i), {op->types[i]}, op->memory_type, op->bounds, op->condition, body);
+                body = Realize::make(op->name + "." + std::to_string(i),
+                                     {op->types[i]}, op->memory_type,
+                                     op->bounds, op->condition, body);
             }
             return body;
         } else {
@@ -157,6 +161,15 @@ class SplitTuples : public IRMutator {
         for (int i = 0; i < (int)op->values.size(); i++) {
             class Checker : public IRVisitor {
                 using IRVisitor::visit;
+                vector<pair<string, Expr>> lets;
+
+                void visit(const Let *op) override {
+                    op->value.accept(this);
+                    lets.emplace_back(op->name, op->value);
+                    op->body.accept(this);
+                    lets.pop_back();
+                }
+
                 void visit(const Call *op) override {
                     if (op->call_type == Call::Halide &&
                         op->name == func_name &&
@@ -167,11 +180,18 @@ class SplitTuples : public IRMutator {
 
                 bool could_alias(const vector<Expr> &a, const vector<Expr> &b) {
                     internal_assert(a.size() == b.size());
-                    if (a.empty()) {
-                        return true;
+                    // Construct a boolean Expr that says the addresses are equal
+                    Expr aliases = const_true();
+                    for (size_t i = 0; i < a.size(); i++) {
+                        aliases = aliases && (a[i] == b[i]);
                     }
-                    // TODO
-                    return true;
+                    // Might need some of the containing lets
+                    for (auto it = lets.rbegin(); it != lets.rend(); it++) {
+                        if (expr_uses_var(aliases, it->first)) {
+                            aliases = Let::make(it->first, it->second, aliases);
+                        }
+                    }
+                    return !can_prove(!aliases);
                 }
 
             public:
