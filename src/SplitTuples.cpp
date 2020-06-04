@@ -208,7 +208,8 @@ class SplitTuples : public IRMutator {
         }
 
         // Build clusters of tuple components where two components
-        // share a cluster if there is cross-talk between them.
+        // belong to the same cluster if any of their loads or stores
+        // may alias
         vector<vector<int>> clusters;
         // Reserve space so that we can use pointers to clusters.
         clusters.reserve(op->values.size());
@@ -242,6 +243,16 @@ class SplitTuples : public IRMutator {
             }
         }
 
+        // If each cluster has only a single store in it, we can use
+        // CAS loops or atomic adds and avoid ever needing to wrap
+        // things in a mutex. We express this using separate atomic
+        // nodes per store. If there's no mutex involved at all, then
+        // there's no benefit in packing things together into a single
+        // critical section.
+        bool separate_atomic_nodes_per_store =
+            ((atomic && atomic->mutex_name.empty()) ||
+             (clusters.size() == op->values.size()));
+
         // For each cluster, build a list of scalar provide
         // statements, and a list of lets to wrap them.
         vector<Stmt> result;
@@ -256,10 +267,14 @@ class SplitTuples : public IRMutator {
             Stmt s;
 
             if (c.size() == 1) {
+                // Just make a provide node
                 int i = *c.begin();
                 string name = op->name + "." + std::to_string(i);
                 s = Provide::make(name, {mutate(op->values[i])}, args);
             } else {
+                // Make a list of let statements that compute the
+                // values (doing any loads), and then a block of
+                // provide statements that do the stores.
                 for (auto i : c) {
                     string name = op->name + "." + std::to_string(i);
                     string var_name = name + ".value";
@@ -280,7 +295,7 @@ class SplitTuples : public IRMutator {
                 }
             }
 
-            if (atomic) {
+            if (atomic && separate_atomic_nodes_per_store) {
                 s = Atomic::make(atomic->producer_name, atomic->mutex_name, s);
             }
 
@@ -288,7 +303,13 @@ class SplitTuples : public IRMutator {
             result.push_back(s);
         }
 
-        return Block::make(result);
+        {
+            Stmt s = Block::make(result);
+            if (atomic && !separate_atomic_nodes_per_store) {
+                s = Atomic::make(atomic->producer_name, atomic->mutex_name, s);
+            }
+            return s;
+        }
     }
 
     Stmt visit(const Provide *op) override {
