@@ -1400,7 +1400,7 @@ Value *CodeGen_LLVM::codegen(const Expr &e) {
     // size one, just extract it out as a scalar.
     if (e.type().is_scalar() &&
         value->getType()->isVectorTy()) {
-        internal_assert(value->getType()->getVectorNumElements() == 1);
+        internal_assert(get_vector_num_elements(value->getType()) == 1);
         value = builder->CreateExtractElement(value, ConstantInt::get(i32_t, 0));
     }
 
