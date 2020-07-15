@@ -273,7 +273,7 @@ IntrusivePtr<State> AutoSchedule::optimal_schedule_pass(int beam_size,
                 continue;
             }
 
-            if (state->num_decisions_made == 2 * (int)dag.nodes.size()) {
+            if (state->num_decisions_made == 2 * (int)dag.num_non_input_nodes) {
                 // We've reached the end of the pass. The first state
                 // must be the best, because we're pulling off a
                 // priority queue.
@@ -393,9 +393,10 @@ IntrusivePtr<State> AutoSchedule::optimal_schedule(int beam_size) {
     }
 
     bool use_pre_pass = get_env_variable("HL_FREEZE_INLINE_COMPUTE_ROOT") == "1";
-    int pass_idx = use_pre_pass ? -1 : 0;
+    int pass_idx = 0;
 
     if (use_pre_pass && num_passes > 1) {
+        pass_idx = -1;
         --num_passes;
     }
 
@@ -500,7 +501,9 @@ void generate_schedule(const std::vector<Function> &outputs,
 
     // Print out the schedule
     if (aslog::aslog_level() > 0) {
+        aslog(0) << "Final generated loop nest and schedule:\n";
         optimal->dump();
+        optimal->print_compute_locations();
     }
 
     string schedule_file = get_env_variable("HL_SCHEDULE_FILE");

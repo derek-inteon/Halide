@@ -459,9 +459,11 @@ FunctionDAG::Edge::BoundInfo::BoundInfo(const Expr &e, const Node::Stage &consum
     const Mul *mul = add ? add->a.as<Mul>() : expr.as<Mul>();
     const IntImm *coeff_imm = mul ? mul->b.as<IntImm>() : nullptr;
     const IntImm *constant_imm = add ? add->b.as<IntImm>() : nullptr;
+    // clang-format off
     Expr v = (mul ? mul->a :
-                    add ? add->a :
-                          expr);
+              add ? add->a :
+                    expr);
+    // clang-format on
     const Variable *var = v.as<Variable>();
 
     if (const IntImm *c = e.as<IntImm>()) {
@@ -637,6 +639,10 @@ FunctionDAG::FunctionDAG(const vector<Function> &outputs, const MachineParams &p
             if (s > 0) {
                 stage.name += ".update(" + std::to_string(s - 1) + ")";
             }
+
+            stage.sanitized_name = node.func.name();
+            sanitize_names(stage.sanitized_name);
+            stage.sanitized_name += "_s" + std::to_string(s);
 
             const Definition &def = (s == 0) ? consumer.definition() : consumer.update(s - 1);
             const StageSchedule &sched = def.schedule();
@@ -951,7 +957,8 @@ FunctionDAG::FunctionDAG(const vector<Function> &outputs, const MachineParams &p
     for (auto &n : nodes) {
         n.bounds_memory_layout.reset(new BoundContents::Layout);
         auto &l = *(n.bounds_memory_layout);
-        l.computed_offset = n.func.dimensions();
+        l.region_required_single_offset = n.func.dimensions();
+        l.computed_offset = l.region_required_single_offset + n.func.dimensions();
         l.total_size = l.computed_offset + n.func.dimensions();
         for (const auto &s : n.stages) {
             l.loop_offset.push_back(l.total_size);
@@ -995,6 +1002,13 @@ FunctionDAG::FunctionDAG(const vector<Function> &outputs, const MachineParams &p
 
     // Compute the algorithm-specific features for the neural net
     featurize();
+
+    for (Node &node : nodes) {
+        if (node.is_input) {
+            continue;
+        }
+        ++num_non_input_nodes;
+    }
 }
 
 void FunctionDAG::featurize() {
@@ -1254,6 +1268,14 @@ int ExprBranching::compute(const Function& f) {
     }
 
     return std::max(branching, visit_nary(args));
+}
+
+void sanitize_names(std::string& str) {
+    bool in_quotes = false;
+    for (auto &c : str) {
+        in_quotes ^= (c == '"');
+        if (!in_quotes && c == '$') c = '_';
+    }
 }
 
 }  // namespace Autoscheduler

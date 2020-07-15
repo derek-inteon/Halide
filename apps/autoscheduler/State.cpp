@@ -599,7 +599,9 @@ bool State::calculate_cost(const FunctionDAG &dag, const MachineParams &params, 
         for (auto it = features.begin(); it != features.end(); it++) {
             auto &stage = *(it.key());
             const auto &feat = it.value();
-            aslog(0) << "Schedule features for " << stage.node->func.name() << "_s" << stage.index << "\n";
+            std::string name = stage.node->func.name();
+            sanitize_names(name);
+            aslog(0) << "Schedule features for " << name << "_s" << stage.index << "\n";
             feat.dump();
         }
     }
@@ -646,6 +648,23 @@ void State::dump() const {
     aslog(0) << "State with cost " << cost << ":\n";
     root->dump("", nullptr);
     aslog(0) << schedule_source;
+}
+
+void State::print_compute_locations() const {
+    StageMap<StageMap<bool>> descendants;
+    root->get_stages_computed_in_each_compute_root_loop(descendants);
+
+    aslog(0) << "BEGIN compute locations\n";
+    for (const auto& d : descendants) {
+        aslog(0) << d.first->sanitized_name << " -> ";
+
+        for (const auto& descendant : d.second) {
+            aslog(0) << descendant.first->sanitized_name << " ";
+        }
+
+        aslog(0) << "\n";
+    }
+    aslog(0) << "END compute locations\n";
 }
 
 void State::fuse_gpu_blocks(LoopNest::StageScheduleState* state, Stage& stage, const vector<VarOrRVar>& parallel_vars, const vector<int64_t>& parallel_extents) const {
@@ -741,15 +760,40 @@ bool State::mark_gpu_threads(LoopNest::StageScheduleState* state, Stage& stage, 
             Func func(state->node->func);
 
             for (const auto *e : state->stage->incoming_edges) {
-                if (!state->constant_region_producers.contains(e->producer)) {
+                if (!state->producers_to_be_staged.contains(e->producer)) {
                     continue;
                 }
 
                 Func producer(e->producer->func);
-                staged_funcs_schedule_source << producer.name() << ".in(" << func.name() << ").compute_at(" << func.name() << ", " << v.var.var.name() << ")";
+                producer.in(func).store_in(MemoryType::Register).compute_at(func, v.var.var);
+                staged_funcs_schedule_source
+                    << producer.name()
+                    << ".in("
+                    << func.name()
+                    << ").store_in(MemoryType::Register).compute_at("
+                    << func.name()
+                    << ", "
+                    << v.var.var.name()
+                    << ")";
+
+                const LoopNest* loop_nest = state->producers_to_be_staged.get(e->producer);
+
+                const auto& bounds = loop_nest->get_bounds(e->producer);
+
+                int i = 0;
                 for (const auto& l : e->producer->stages[0].loop) {
                     Var unrolled_var(l.var);
-                    producer.in(func).compute_at(func, v.var.var).unroll(unrolled_var);
+
+                    int extent = bounds->region_required(i++).extent();
+                    producer.in(func).bound_extent(unrolled_var, extent);
+                    staged_funcs_schedule_source
+                        << "\n    .bound_extent("
+                        << unrolled_var.name()
+                        << ", "
+                        << extent
+                        << ")";
+
+                    producer.in(func).unroll(unrolled_var);
                     staged_funcs_schedule_source << "\n    .unroll(" << unrolled_var.name() << ")";
                 }
                 staged_funcs_schedule_source << ";\n";
@@ -778,10 +822,14 @@ void State::apply_schedule(const FunctionDAG &dag, const MachineParams &params, 
     StageMap<std::unique_ptr<LoopNest::StageScheduleState>> state_map;
     std::vector<LoopNest::StageScheduleState*> ancestors;
 
-    root->apply(LoopLevel::root(), state_map, params.parallelism, 0, nullptr, nullptr, target, ancestors);
+    NodeMap<bool> all_inlined;
+    root->collect_all_inlined(all_inlined);
+    root->apply(LoopLevel::root(), state_map, params.parallelism, 0, nullptr, nullptr, target, ancestors, all_inlined);
 
     std::ostringstream src;
     std::unordered_set<std::string> new_serial_vars;
+
+    src << "auto pipeline = get_pipeline();\n";
 
     // Print handles for all the Funcs
     int i = (int)(dag.nodes.size() - 1);
@@ -837,7 +885,7 @@ void State::apply_schedule(const FunctionDAG &dag, const MachineParams &params, 
         vector<int64_t> parallel_extents;
         bool any_parallel_vars = false, any_parallel_rvars = false;
         for (auto it = p.second->vars.rbegin(); it != p.second->vars.rend(); it++) {
-            if (!it->exists || it->extent == 1) continue;
+            if (!it->exists) continue;
             if (!it->parallel) break;
             any_parallel_rvars |= it->var.is_rvar;
             any_parallel_vars |= !it->var.is_rvar;
@@ -1012,11 +1060,7 @@ void State::apply_schedule(const FunctionDAG &dag, const MachineParams &params, 
 
     // Sanitize the names of things to make them legal source code.
     schedule_source = src.str();
-    bool in_quotes = false;
-    for (auto &c : schedule_source) {
-        in_quotes ^= (c == '"');
-        if (!in_quotes && c == '$') c = '_';
-    }
+    sanitize_names(schedule_source);
 }
 
 }  // namespace Autoscheduler
