@@ -94,6 +94,29 @@ function build_retrain_cost_model() {
     echo
 }
 
+function build_get_host_target() {
+    local -r halide_root=$1
+    get_autoscheduler_dir $halide_root autoscheduler_dir
+    get_absolute_autoscheduler_bin_dir $halide_root autoscheduler_bin_dir
+
+    echo
+    echo "Building get_host_target..."
+    make -C ${autoscheduler_dir} ${autoscheduler_bin_dir}/get_host_target
+    echo
+}
+
+function get_host_target() {
+    local -r halide_root=$1
+    local -n host_target_ref=$2
+
+    get_absolute_autoscheduler_bin_dir $halide_root autoscheduler_bin_dir
+
+    echo "Calling get_host_target()..."
+    host_target_ref=$(${AUTOSCHED_BIN}/get_host_target)
+    echo "host_target = ${host_target_ref}"
+    echo
+}
+
 function build_autoscheduler_tools() {
     local -r halide_root=$1
     get_autoscheduler_dir $halide_root autoscheduler_dir
@@ -103,6 +126,7 @@ function build_autoscheduler_tools() {
     build_featurization_to_sample $halide_root
     build_retrain_cost_model $halide_root
     build_libauto_schedule $halide_root
+    build_get_host_target $halide_root
     echo
 }
 
@@ -134,6 +158,19 @@ function retrain_cost_model() {
             --predictions_file=${predictions_file} \
             --verbose=${verbose} \
             --partition_schedules=${partition_schedules}
+}
+
+function predict_cost() {
+    local -r halide_root=$1
+    local -r samples_dir=$2
+    local -r weights=$3
+    local -r predictions_file=${4}
+
+    get_absolute_autoscheduler_bin_dir ${halide_root} autosched_bin
+
+    local -r num_cores=80
+    local -r num_epochs=1
+    retrain_cost_model ${HALIDE_ROOT} ${SAMPLES_DIR} ${WEIGHTS_FILE} 80 1 0 0.001 ${PREDICTIONS_FILE}
 }
 
 function find_equal_predicted_pairs() {
@@ -280,7 +317,7 @@ function extract_sample_details() {
 
     local -r time=$(head -n 1 ${bench} | cut -d" " -f 8)
 
-    local -r time_ms=$(echo "${time} * 1000" | bc -l | awk '{printf "%.6f\n", $0}')
+    local -r time_ms=$(echo "${time}" | awk '{printf "%.6f\n", $0 * 1000}')
     echo "" >> ${output_file}
     echo "Run time (ms) = ${time_ms}" >> ${output_file}
 
@@ -334,9 +371,15 @@ function save_best_schedule_result() {
         return
     fi
 
-    local -r current_best_run_time=$(tail -n 1 $best_details_file | cut -d" " -f 5)
+    local current_best_run_time=$(tail -n 1 $best_details_file | cut -d" " -f 5)
 
-    local -r new_best=$(echo "$candidate_run_time < $current_best_run_time" | bc -l)
+    local new_best=1
+    if [ ${current_best_run_time} ]; then
+        new_best=$(echo "$candidate_run_time < $current_best_run_time" | bc -l)
+    else
+        current_best_run_time="?"
+    fi
+
     if [ $new_best -eq 1 ]; then
         echo "Candidate run time (${candidate_run_time} ms) is faster than the current best run time (${current_best_run_time} ms). Copying in candidate files as new best results..."
         cp $candidate_details_file $best_details_file
@@ -351,7 +394,7 @@ function save_best_schedule_result() {
 function print_best_schedule_times() {
     local -r dir=$1
 
-    local -r apps="resnet_50_blockwise bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate_generator conv_layer cuda_mat_mul iir_blur_generator"
+    local -r apps="resnet_50_blockwise bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur_generator depthwise_separable_conv"
 
     for app in $apps; do
         local file=$dir/$app.txt
@@ -396,7 +439,7 @@ function format_metrics() {
     fi
 
     for stage in ${stages}; do
-        grep -A 10 "kernel_${stage}" "${metrics_file}" | tail -n +2 | awk -v s="${stage}" '{printf("%s %s %f\n", s, $2, $NF);}' >> "${formatted_metrics_file}"
+        grep -A 16 "kernel_${stage}" "${metrics_file}" | tail -n +2 | awk -v s="${stage}" '{printf("%s %s %f\n", s, $2, $NF);}' >> "${formatted_metrics_file}"
         grep "kernel_${stage}" "${trace_64_file}" | tail -n 1 | awk -v s="${stage}" '{printf("%s registers_64 %d\n", s, $9);}' >> "${formatted_metrics_file}"
         grep "kernel_${stage}" "${trace_256_file}" | tail -n 1 | awk -v s="${stage}" '{printf("%s registers_256 %d\n", s, $9);}' >> "${formatted_metrics_file}"
     done
@@ -481,4 +524,18 @@ function get_num_local_cores() {
     else
         num_local_cores_ref=$(nproc)
     fi
+}
+
+function find_unused_gpu() {
+    local -r num_gpus=$1
+    local -n gpu_id_ref=$2
+
+    for ((index=0;index<num_gpus;index++)); do
+        if nvidia-smi -i ${index} | grep -q "No running processes found"; then
+            gpu_id_ref=${index}
+            return 0
+        fi
+    done
+
+    return 1
 }

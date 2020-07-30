@@ -24,13 +24,15 @@ class MemAccessType(Enum):
   SHARED_MEM_STORE = "shared_mem_store"
 
 class MemAccess:
-  def __init__(self, mem_type, access_type, consumer, compute_root_stage, producer, num_requests_per_block, num_blocks, num_transactions_per_request, all_coeffs_exist):
+  def __init__(self, mem_type, access_type, consumer, compute_root_stage, producer, num_requests_per_block, num_blocks, num_transactions_per_request, tail_num_requests_per_block, tail_num_transactions_per_request, all_coeffs_exist):
     self.mem_type = mem_type
     self.access_type = access_type
     self.consumer = consumer
     self.compute_root_stage = compute_root_stage
     self.num_requests = num_blocks * num_requests_per_block
     self.num_transactions = self.num_requests * num_transactions_per_request
+    self.num_requests += num_blocks * tail_num_requests_per_block
+    self.num_transactions += num_blocks * tail_num_requests_per_block * tail_num_transactions_per_request
     self.all_coeffs_exist = all_coeffs_exist
     self.key = "{}_{}_{}".format(compute_root_stage, mem_type.value, access_type.value)
 
@@ -87,10 +89,20 @@ class MemAccess:
       "num_blocks",
       "num_requests_per_block",
       "num_transactions_per_request",
+      "tail_num_requests_per_block",
+      "tail_num_transactions_per_request",
       "all_coeffs_exist",
     ]
 
     for k in expected_keys:
+      if "tail_num_requests_per_block" not in mem_access:
+        mem_access["tail_num_requests_per_block"] = 0
+      if "tail_num_transactions_per_request" not in mem_access:
+        mem_access["tail_num_transactions_per_request"] = 0
+
+      if k not in mem_access:
+        continue
+        pdb.set_trace()
       assert(k in mem_access)
 
     return MemAccess(**mem_access)
@@ -118,8 +130,8 @@ class FeatureParser:
       "num_blocks",
       "num_transactions_per_request",
       "num_requests_per_block",
-      "tail_warp_num_requests_per_block",
-      "tail_warp_num_transactions_per_request",
+      "tail_num_requests_per_block",
+      "tail_num_transactions_per_request",
     ]
 
     self.feature_names = set([
@@ -219,13 +231,12 @@ class FeatureParser:
   def process_features(self):
     processed_features = {}
     for stage in self.features:
-      compute_root_stage = self.stages[stage]
-
       num_blocks = int(self.features[stage]["num_blocks"])
       num_global_stores_per_block = int(self.features[stage]["num_global_mem_stores_per_block"])
       num_global_loads_per_block = int(self.features[stage]["num_global_mem_loads_per_block"])
       num_shared_stores_per_block = int(self.features[stage]["num_shared_mem_stores_per_block"])
       num_shared_loads_per_block = int(self.features[stage]["num_shared_mem_loads_per_block"])
+
       global_mem_load_efficiency = float(self.features[stage]["global_mem_load_efficiency"])
       global_mem_store_efficiency = float(self.features[stage]["global_mem_store_efficiency"])
 
@@ -234,9 +245,13 @@ class FeatureParser:
       num_shared_stores = num_blocks * num_shared_stores_per_block
       num_shared_loads = num_blocks * num_shared_loads_per_block
 
+      if num_global_loads == 0 and num_global_stores == 0 and num_shared_loads == 0 and num_shared_stores == 0:
+        continue
+
       global_mem_load_transactions_used = global_mem_load_efficiency * num_global_loads
       global_mem_store_transactions_used = global_mem_store_efficiency * num_global_stores
 
+      compute_root_stage = self.stages[stage]
       if not compute_root_stage in processed_features:
         processed_features[compute_root_stage] = {
           "num_blocks": num_blocks,

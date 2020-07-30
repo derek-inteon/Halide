@@ -9,7 +9,7 @@
 
 /** \file
  *
- * Data structure that helps track global memory access information. Useful when 
+ * Data structures that help track memory access information. Useful when
  * computing GPU features
  */
 
@@ -21,6 +21,8 @@ struct GlobalMem;
 struct GlobalAccessAccumulator;
 struct SharedMem;
 struct SharedAccessAccumulator;
+struct LocalMem;
+struct LocalAccessAccumulator;
 
 template <typename T>
 struct MemTraits;
@@ -28,13 +30,22 @@ struct MemTraits;
 template <>
 struct MemTraits<GlobalMem> {
     static constexpr double bytes_per_transaction = 32;
+    using MemInfoType = GlobalMem;
     using Accumulator = GlobalAccessAccumulator;
 };
 
 template <>
 struct MemTraits<SharedMem> {
     static constexpr double bytes_per_transaction = 128;
+    using MemInfoType = SharedMem;
     using Accumulator = SharedAccessAccumulator;
+};
+
+template <>
+struct MemTraits<LocalMem> {
+    static constexpr double bytes_per_transaction = 32;
+    using MemInfoType = GlobalMem; // Local mem behaves similarly to global mem
+    using Accumulator = LocalAccessAccumulator;
 };
 
 template <typename T>
@@ -93,43 +104,76 @@ private:
     double total_num_bytes = 0;
 };
 
-using GlobalMemInfo = MemInfo<GlobalMem>;
-using SharedMemInfo = MemInfo<SharedMem>;
+template <typename T>
+using MemInfoType = MemInfo<typename MemTraits<T>::MemInfoType>;
 
-struct StorageStrides {
+using GlobalMemInfo = MemInfoType<GlobalMem>;
+using SharedMemInfo = MemInfoType<SharedMem>;
+using LocalMemInfo = MemInfoType<LocalMem>;
+
+struct Strides {
 public:
-    void add_valid(double stride) {
-        add(stride, true);
+    Strides(const std::vector<int64_t>& storage_strides)
+        : storage_strides{storage_strides}
+    {}
+
+    void add_valid(const std::vector<double>& strides) {
+        add(strides, true);
     }
 
     void add_invalid() {
-        add(0, false);
+        add({}, false);
     }
 
-    void multiply_by_scalar(double scalar) {
-        for (double& s : values) {
-            s *= scalar;
+    bool valid(size_t loop_index) const {
+        return is_valid[loop_index];
+    }
+
+    int64_t offset(size_t loop_index, int64_t point) const {
+        internal_assert(loop_index < is_valid.size() && valid(loop_index));
+        internal_assert(index_strides[loop_index].size() == storage_strides.size());
+
+        int64_t result = 0;
+        for (size_t i = 0; i < storage_strides.size(); ++i) {
+            result += (int64_t)(point * index_strides[loop_index][i]) * storage_strides[i];
+        }
+        return std::abs(result);
+    }
+
+    void dump(bool verbose=false) {
+        if (!verbose) {
+            return;
+        }
+
+        for (size_t i = 0; i < storage_strides.size(); ++i) {
+            if (!valid(i)) {
+                aslog(0) << "stride " << i << ": invalid\n";
+                continue;
+            }
+            aslog(0) << "storage_stride " << i << ": " << storage_strides[i] << "\n";
+        }
+
+        for (size_t i = 0; i < index_strides.size(); ++i) {
+            for (size_t j = 0; j < index_strides[i].size(); ++j) {
+                aslog(0) << "index_stride " << i << ", storage_stride " << j << ": " << index_strides[i][j] << " ";
+            }
+            aslog(0) << "\n";
         }
     }
 
-    bool valid(size_t i) const {
-        return is_valid[i];
-    }
-
-    double operator[](size_t i) const {
-        return values[i];
-    }
 private:
-    void add(double stride, bool e) {
-        values.push_back(stride);
+    void add(const std::vector<double>& strides, bool e) {
+        index_strides.push_back(strides);
         is_valid.push_back(e);
     }
-    std::vector<double> values;
+
+    std::vector<int64_t> storage_strides;
+    std::vector<std::vector<double>> index_strides;
     std::vector<bool> is_valid;
 };
 
 struct GlobalAccessAccumulator {
-    GlobalAccessAccumulator(int bytes_per_access, size_t dimensions, const StorageStrides& strides, bool verbose)
+    GlobalAccessAccumulator(int bytes_per_access, size_t dimensions, const Strides& strides, bool verbose)
         : bytes_per_access{bytes_per_access}
         , dimensions{dimensions}
         , strides{strides}
@@ -152,7 +196,7 @@ struct GlobalAccessAccumulator {
                 ++unknown_sectors;
                 return;
             }
-            byte += bytes_per_access * (int)(thread_ids[i] * strides[i]);
+            byte += bytes_per_access * strides.offset(i, thread_ids[i]);
         }
 
         if (verbose) {
@@ -208,14 +252,14 @@ struct GlobalAccessAccumulator {
 private:
     int bytes_per_access;
     size_t dimensions;
-    StorageStrides strides;
+    Strides strides;
     bool verbose;
     int unknown_sectors = 0;
     std::unordered_map<int64_t, std::unordered_set<int64_t>> sectors_accessed;
 };
 
 struct SharedAccessAccumulator {
-    SharedAccessAccumulator(int bytes_per_access, size_t dimensions, const StorageStrides& strides, bool verbose)
+    SharedAccessAccumulator(int bytes_per_access, size_t dimensions, const Strides& strides, bool verbose)
         : bytes_per_access{bytes_per_access}
         , dimensions{dimensions}
         , strides{strides}
@@ -238,7 +282,7 @@ struct SharedAccessAccumulator {
                 ++unknown_banks;
                 return;
             }
-            byte += bytes_per_access * (int)(thread_ids[i] * strides[i]);
+            byte += bytes_per_access * strides.offset(i, thread_ids[i]);
         }
 
         if (verbose) {
@@ -302,40 +346,65 @@ struct SharedAccessAccumulator {
 private:
     int bytes_per_access;
     size_t dimensions;
-    StorageStrides strides;
+    Strides strides;
     bool verbose;
     int unknown_banks = 0;
     std::unordered_set<int64_t> bytes_accessed;
     std::array<std::unordered_set<int64_t>, 32> bank_to_words_accessed;
 };
 
-struct LocalMemInfo {
-    void add_access(double num_accesses, double stride) {
-        total_accesses += num_accesses;
-        add_stride(stride);
-    }
+struct LocalAccessAccumulator {
+    LocalAccessAccumulator(int bytes_per_access, size_t dimensions, bool verbose)
+        : bytes_per_access{bytes_per_access}
+        , dimensions{dimensions}
+        , verbose{verbose}
+    {}
 
-    double average_efficiency() const {
-        if (total_stride == 0) {
-            return 1.0;
-        }
-        return 1.0 / (total_stride / num_entries);
-    }
-
-    double total_accesses = 0;
-
-private:
-    void add_stride(double stride) {
-        if (stride == 0) {
+    void operator()(int thread_id, int x, int y, int z, int active, bool last_thread) {
+        if (!active) {
             return;
         }
 
-        total_stride += std::min(32.0, std::max(1.0, stride));
-        ++num_entries;
+        ++thread_count;
+
+        if (verbose) {
+            aslog(0) << "thread_id: " << thread_id << " (" << x << ", " << y << ", " << z << ")\n"; 
+        }
     }
 
-    int num_entries = 0;
-    double total_stride = 0;
+    void add_access_info(int num_requests, LocalMemInfo& local_mem_info, bool is_tail_warp) const {
+        int num_bytes_used_per_request = thread_count * bytes_per_access;
+        int sectors_accessed = std::ceil((float)num_bytes_used_per_request / (float)LocalMemInfo::bytes_per_transaction);
+        int num_transactions_per_request = sectors_accessed;
+
+        if (verbose) {
+            if (is_tail_warp) {
+                aslog(0) << "tail_";
+            }
+            aslog(0) << "num_transactions_per_request = " << num_transactions_per_request << "\n";
+        }
+
+        if (verbose) {
+            if (is_tail_warp) {
+                aslog(0) << "tail_";
+            }
+            aslog(0) << "num_requests_per_block = " << num_requests << "\n";
+        }
+
+        local_mem_info.add_access_info(
+            num_requests,
+            num_transactions_per_request,
+            num_bytes_used_per_request
+        );
+    }
+
+private:
+    int bytes_per_access;
+    size_t dimensions;
+    bool verbose;
+    int thread_count = 0;
+    int unknown_sectors = 0;
+    std::unordered_map<int64_t, std::unordered_set<int64_t>> sectors_accessed;
 };
 
 

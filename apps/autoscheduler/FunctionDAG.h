@@ -302,10 +302,6 @@ struct BoundContents {
         return data()[i];
     }
 
-    Span &region_required_single(int i) {
-        return data()[i + layout->region_required_single_offset];
-    }
-
     Span &region_computed(int i) {
         return data()[i + layout->computed_offset];
     }
@@ -316,10 +312,6 @@ struct BoundContents {
 
     const Span &region_required(int i) const {
         return data()[i];
-    }
-
-    const Span &region_required_single(int i) const {
-        return data()[i + layout->region_required_single_offset];
     }
 
     const Span &region_computed(int i) const {
@@ -358,9 +350,6 @@ struct BoundContents {
     public:
         // number of Span to allocate
         int total_size;
-
-        // region_required has size func->dimensions() and comes first in the memory layout
-        int region_required_single_offset;
 
         // region_computed comes next at the following index
         int computed_offset;
@@ -511,6 +500,19 @@ struct FunctionDAG {
             Stage(Halide::Stage s)
                 : stage(s) {
             }
+
+            int get_loop_index_from_var(const std::string& var) const {
+                int i = 0;
+                for (const auto& l : loop) {
+                    if (l.var == var) {
+                        return i;
+                    }
+
+                    ++i;
+                }
+
+                return -1;
+            }
         };
         vector<Stage> stages;
 
@@ -657,6 +659,7 @@ public:
     int visit(const Call *op);
     int visit(const Shuffle *op);
     int visit(const Let *op);
+    int visit(const VectorReduce *op);
     int visit_binary(const Expr &a, const Expr &b);
     int visit_nary(const std::vector<Expr>& exprs);
 

@@ -957,8 +957,7 @@ FunctionDAG::FunctionDAG(const vector<Function> &outputs, const MachineParams &p
     for (auto &n : nodes) {
         n.bounds_memory_layout.reset(new BoundContents::Layout);
         auto &l = *(n.bounds_memory_layout);
-        l.region_required_single_offset = n.func.dimensions();
-        l.computed_offset = l.region_required_single_offset + n.func.dimensions();
+        l.computed_offset = n.func.dimensions();
         l.total_size = l.computed_offset + n.func.dimensions();
         for (const auto &s : n.stages) {
             l.loop_offset.push_back(l.total_size);
@@ -1248,6 +1247,10 @@ int ExprBranching::visit(const Shuffle *op) {
 
 int ExprBranching::visit(const Let *op) {
     return visit_binary(op->value, op->body);
+}
+
+int ExprBranching::visit(const VectorReduce *op) {
+    return Super::dispatch(op->value);
 }
 
 int ExprBranching::compute(const Function& f) {

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-if [[ $# -ne 4 && $# -ne 5 ]]; then
-    echo "Usage: $0 max_iterations resume train_only predict_only app"
+if [[ $# -ne 5 && $# -ne 6 ]]; then
+    echo "Usage: $0 max_iterations resume train_only predict_only compare_with_metrics app"
     exit
 fi
 
@@ -9,7 +9,8 @@ MAX_ITERATIONS=${1}
 RESUME=${2}
 TRAIN_ONLY=${3}
 PREDICT_ONLY=${4}
-APP=${5}
+COMPARE_WITH_METRICS=${5}
+APP=${6}
 
 if [[ $PREDICT_ONLY == 1 && $TRAIN_ONLY == 1 ]]; then
     echo "At most one of train_only and predict_only can be set to 1."
@@ -35,10 +36,13 @@ export HL_MACHINE_PARAMS=80,24000000,160
 export HL_PERMIT_FAILED_UNROLL=1
 
 if [ -z ${HL_TARGET} ]; then
-    HL_TARGET=host-cuda
+    get_host_target ${HALIDE_ROOT} HL_TARGET
+    HL_TARGET=${HL_TARGET}-cuda
 fi
 
 export HL_TARGET=${HL_TARGET}
+
+echo "HL_TARGET set to ${HL_TARGET}"
 
 if [ -z ${SAMPLES_DIR} ]; then
     DEFAULT_SAMPLES_DIR_NAME=autotuned_samples
@@ -72,7 +76,7 @@ function ctrl_c() {
 trap ctrl_c INT
 
 if [ -z $APP ]; then
-    APPS="bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate_generator conv_layer cuda_mat_mul iir_blur_generator depthwise_separable_conv"
+    APPS="bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur_generator depthwise_separable_conv"
 else
     APPS=$APP
 fi
@@ -137,6 +141,11 @@ for app in $APPS; do
 
     save_best_schedule_result ${BEST_SCHEDULES_DIR} ${SAMPLES_DIR}
     python3 ${SCRIPTS_DIR}/scatter.py --predictions ${PREDICTIONS_FILE} --app ${app} --output ${SAMPLES_DIR}
+
+    if [[ $COMPARE_WITH_METRICS == 1 ]]; then
+        echo "Comparing with metrics..."
+        bash ${SCRIPTS_DIR}/compare_with_metrics.sh ${app} ${CURRENT_DATE_TIME} 5
+    fi
 done
 
 print_best_schedule_times $(dirname $0)/best

@@ -314,7 +314,7 @@ void State::set_gpu_store_site(const map<const LoopNest *, pair<const LoopNest *
     internal_assert(type_has_been_set);
 }
 
-void State::compute_featurization(const FunctionDAG &dag, const MachineParams &params, const Target& target, StageMap<ScheduleFeatures> *features, Statistics& stats, bool verbose) const {
+bool State::compute_featurization(const FunctionDAG &dag, const MachineParams &params, const Target& target, StageMap<ScheduleFeatures> *features, Statistics& stats, bool verbose) const {
     auto feature_root = get_root_for_features(params, target);
 
     StageMap<LoopNest::Sites> sites;
@@ -324,6 +324,9 @@ void State::compute_featurization(const FunctionDAG &dag, const MachineParams &p
     StageMap<int64_t> total_shared_mem_alloc_sizes;
     total_shared_mem_alloc_sizes.make_large(dag.nodes[0].stages[0].max_id);
     feature_root->get_sites(target, sites, total_shared_mem_alloc_sizes);
+    if (!feature_root->promote_allocs_to_registers(target, sites)) {
+        return false;
+    }
 
     // For the input nodes and unscheduled outputs, the compute
     // and store sites are root, and the produce and innermost
@@ -423,6 +426,8 @@ void State::compute_featurization(const FunctionDAG &dag, const MachineParams &p
                 << n.func.name() << "\n";
         }
     }
+
+    return true;
 }
 
 void State::save_featurization(const FunctionDAG &dag, const MachineParams &params, const Target& target, std::ostream &out) const {
@@ -572,18 +577,22 @@ bool State::exceeds_local_memory_limit(const Target &target) const {
 bool State::calculate_cost(const FunctionDAG &dag, const MachineParams &params, const Target& target, CostModel *cost_model, Statistics& stats, bool verbose) {
     Timer timer;
     if (!root->has_valid_thread_extents()) {
+        Filter(root.get()) << "Invalid thread extents\n";
         return false;
     }
 
     if (exceeds_shared_memory_limit(target)) {
+        Filter(root.get()) << "Exceeds shared memory limit\n";
         return false;
     }
 
     if (exceeds_local_memory_limit(target)) {
+        Filter(root.get()) << "Exceeds local memory limit\n";
         return false;
     }
 
     if (exceeds_serial_extents_limit(target)) {
+        Filter(root.get()) << "Exceeds serial loop extent limit\n";
         return false;
     }
 
@@ -591,7 +600,10 @@ bool State::calculate_cost(const FunctionDAG &dag, const MachineParams &params, 
 
     StageMap<ScheduleFeatures> features;
 
-    compute_featurization(dag, params, target, &features, stats, verbose);
+    if (!compute_featurization(dag, params, target, &features, stats, verbose)) {
+        Filter(root.get()) << "Contains a local allocation that likely cannot be promoted to registers\n";
+        return false;
+    }
 
     cost = 0;
 
@@ -613,6 +625,12 @@ bool State::calculate_cost(const FunctionDAG &dag, const MachineParams &params, 
         if (!it.key()->node->is_wrapper) {  // It's OK to repeatedly stage data
             auto &feat = it.value();
             if (feat.points_computed_total + feat.inlined_calls > 8 * feat.points_computed_minimum) {
+                Filter(root.get()) << "Excess recompute for " << it.key()->node->func.name() << " stage " << it.key()->index << "\n"
+                    << "points_computed_total = " << feat.points_computed_total << "\n"
+                    << "inlined_calls = " << feat.inlined_calls << "\n"
+                    << "points_computed_total + inlined_calls = " << feat.points_computed_total + feat.inlined_calls << "\n"
+                    << "points_computed_minimum = " << feat.points_computed_minimum << "\n"
+                    << "8 * points_computed_minimum = " << 8 * feat.points_computed_minimum << "\n";
                 cost = 1e50;
                 return false;
             }
@@ -759,12 +777,10 @@ bool State::mark_gpu_threads(LoopNest::StageScheduleState* state, Stage& stage, 
 
             Func func(state->node->func);
 
-            for (const auto *e : state->stage->incoming_edges) {
-                if (!state->producers_to_be_staged.contains(e->producer)) {
-                    continue;
-                }
+            for (const auto& to_be_staged : state->producers_to_be_staged) {
+                const auto* producer_node = to_be_staged.first;
 
-                Func producer(e->producer->func);
+                Func producer(producer_node->func);
                 producer.in(func).store_in(MemoryType::Register).compute_at(func, v.var.var);
                 staged_funcs_schedule_source
                     << producer.name()
@@ -776,12 +792,12 @@ bool State::mark_gpu_threads(LoopNest::StageScheduleState* state, Stage& stage, 
                     << v.var.var.name()
                     << ")";
 
-                const LoopNest* loop_nest = state->producers_to_be_staged.get(e->producer);
+                const LoopNest* loop_nest = to_be_staged.second;
 
-                const auto& bounds = loop_nest->get_bounds(e->producer);
+                const auto& bounds = loop_nest->get_bounds(producer_node);
 
                 int i = 0;
-                for (const auto& l : e->producer->stages[0].loop) {
+                for (const auto& l : producer_node->stages[0].loop) {
                     Var unrolled_var(l.var);
 
                     int extent = bounds->region_required(i++).extent();
