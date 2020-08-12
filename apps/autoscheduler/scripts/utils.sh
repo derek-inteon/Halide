@@ -2,7 +2,7 @@
 
 function find_halide() {
     local -n halide_root_ref=$1
-    local -r silent=$2 || 0
+    local -r silent="${2:-0}"
     local dir=$(pwd)
 
     for i in {1..5}; do
@@ -64,7 +64,7 @@ function get_autoscheduler_scripts_dir() {
 function build_featurization_to_sample() {
     local -r halide_root=$1
     get_autoscheduler_dir $halide_root autoscheduler_dir
-    get_absolute_autoscheduler_bin_dir $halide_root autoscheduler_bin_dir
+    get_autoscheduler_bin_dir autoscheduler_bin_dir
 
     echo
     echo "Building featurization_to_sample..."
@@ -75,7 +75,7 @@ function build_featurization_to_sample() {
 function build_libauto_schedule() {
     local -r halide_root=$1
     get_autoscheduler_dir $halide_root autoscheduler_dir
-    get_absolute_autoscheduler_bin_dir $halide_root autoscheduler_bin_dir
+    get_autoscheduler_bin_dir autoscheduler_bin_dir
 
     echo
     echo "Building libauto_schedule..."
@@ -86,7 +86,7 @@ function build_libauto_schedule() {
 function build_retrain_cost_model() {
     local -r halide_root=$1
     get_autoscheduler_dir $halide_root autoscheduler_dir
-    get_absolute_autoscheduler_bin_dir $halide_root autoscheduler_bin_dir
+    get_autoscheduler_bin_dir autoscheduler_bin_dir
 
     echo
     echo "Building retrain_cost_model..."
@@ -97,7 +97,7 @@ function build_retrain_cost_model() {
 function build_get_host_target() {
     local -r halide_root=$1
     get_autoscheduler_dir $halide_root autoscheduler_dir
-    get_absolute_autoscheduler_bin_dir $halide_root autoscheduler_bin_dir
+    get_autoscheduler_bin_dir autoscheduler_bin_dir
 
     echo
     echo "Building get_host_target..."
@@ -394,7 +394,7 @@ function save_best_schedule_result() {
 function print_best_schedule_times() {
     local -r dir=$1
 
-    local -r apps="resnet_50_blockwise bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur_generator depthwise_separable_conv"
+    local -r apps="resnet_50_blockwise bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur depthwise_separable_conv"
 
     for app in $apps; do
         local file=$dir/$app.txt
@@ -422,14 +422,10 @@ function format_metrics() {
     local -r stages=$(grep "features" ${dir}/compile_err.txt | cut -d" " -f 4)
 
     local -r metrics_file="${dir}/metrics.log"
-    local -r trace_64_file="${dir}/trace_64.log"
-    local -r trace_256_file="${dir}/trace_256.log"
     local -r formatted_metrics_file="${dir}/formatted_metrics.txt"
 
     if [ ! -f ${metrics_file} ]; then
         echo "Collecting metrics for ${dir}..."
-        bash "${dir}/trace_64_command.txt"
-        bash "${dir}/trace_256_command.txt"
         bash "${dir}/metrics_command.txt"
     fi
 
@@ -440,8 +436,6 @@ function format_metrics() {
 
     for stage in ${stages}; do
         grep -A 16 "kernel_${stage}" "${metrics_file}" | tail -n +2 | awk -v s="${stage}" '{printf("%s %s %f\n", s, $2, $NF);}' >> "${formatted_metrics_file}"
-        grep "kernel_${stage}" "${trace_64_file}" | tail -n 1 | awk -v s="${stage}" '{printf("%s registers_64 %d\n", s, $9);}' >> "${formatted_metrics_file}"
-        grep "kernel_${stage}" "${trace_256_file}" | tail -n 1 | awk -v s="${stage}" '{printf("%s registers_256 %d\n", s, $9);}' >> "${formatted_metrics_file}"
     done
 
     echo "Formatted metrics saved to ${formatted_metrics_file}"
@@ -527,15 +521,51 @@ function get_num_local_cores() {
 }
 
 function find_unused_gpu() {
-    local -r num_gpus=$1
-    local -n gpu_id_ref=$2
+    local -r benchmark_queue_dir=$1
+    local -r num_gpus=$2
+    local -n gpu_id_ref=$3
 
     for ((index=0;index<num_gpus;index++)); do
-        if nvidia-smi -i ${index} | grep -q "No running processes found"; then
+        exists=0
+        # If a GPU is in use in the benchmark queue, a file will have the suffix
+        # _gpu_${index}
+        for f in ${benchmark_queue_dir}/*-gpu_${index}; do
+            [ -e "$f" ] && exists=1
+            break
+        done
+
+        if [[ $exists == 0 ]]; then
             gpu_id_ref=${index}
             return 0
         fi
     done
 
     return 1
+}
+
+function get_bench_args() {
+    local -r images_dir=$1
+    local -r app=$2
+    local -r sample_dir=$3
+    local -n bench_args_ref=$4
+
+    case $app in
+        "bgu") bench_args_ref="splat_loc=${images_dir}/low_res_in.png values=${images_dir}/low_res_out.png slice_loc=${images_dir}/rgb.png r_sigma=0.125 s_sigma=16" ;;
+        "bilateral_grid") bench_args_ref="input=${images_dir}/gray.png r_sigma=0.1" ;;
+        "local_laplacian") bench_args_ref="input=${images_dir}/rgb.png levels=8 alpha=1 beta=1" ;;
+        "lens_blur") bench_args_ref="left_im=${images_dir}/rgb.png right_im=${images_dir}/rgb.png slices=32 focus_depth=13 blur_radius_scale=0.5 aperture_samples=32" ;;
+        "nl_means") bench_args_ref="input=${images_dir}/rgb.png patch_size=7 search_area=7 sigma=0.12" ;;
+        "camera_pipe") bench_args_ref="input=${images_dir}/bayer_raw.png matrix_3200=${images_dir}/matrix_3200.mat matrix_7000=${images_dir}/matrix_7000.mat color_temp=3700 gamma=2.0 contrast=50 sharpen_strength=1.0 blackLevel=25 whiteLevel=1023" ;;
+        "stencil_chain") bench_args_ref="input=${images_dir}/rgb.png" ;;
+        "harris") bench_args_ref="input=${images_dir}/rgba.png" ;;
+        "hist") bench_args_ref="input=${images_dir}/rgb.png" ;;
+        "max_filter") bench_args_ref="input=${images_dir}/rgb.png" ;;
+        "unsharp") bench_args_ref="input=${images_dir}/rgba.png" ;;
+        "interpolate") bench_args_ref="input=${images_dir}/rgba.png" ;;
+        "conv_layer") bench_args_ref="--estimate_all" ;;
+        "cuda_mat_mul") bench_args_ref="A=zero:estimate B=zero:estimate" ;;
+        "iir_blur") bench_args_ref="input=${images_dir}/rgba.png alpha=0.5" ;;
+        "depthwise_separable_conv") bench_args_ref="--estimate_all" ;;
+        *) bench_args_ref="--estimate_all" ;;
+    esac
 }

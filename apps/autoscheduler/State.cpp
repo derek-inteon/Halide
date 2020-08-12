@@ -57,6 +57,64 @@ void State::compute_loop_nest_parents(map<const LoopNest *, pair<const LoopNest 
     }
 }
 
+const LoopNest *State::deepest_valid_compute_location(const map<const LoopNest *, pair<const LoopNest *, int>> &parent, const FunctionDAG::Node &node, const LoopNest *loop, const LoopNest *root) const {
+    std::vector<const LoopNest*> ancestors;
+
+    const LoopNest *cur_loop = loop;
+    while (parent.count(cur_loop) > 0) {
+        ancestors.push_back(parent.at(cur_loop).first);
+        cur_loop = ancestors.back();
+    }
+
+    if (ancestors.size() == 0) {
+        return root;
+    }
+
+    const LoopNest *candidate = ancestors.back();
+    bool first = true;
+
+    for (auto it = ancestors.rbegin(); it != ancestors.rend(); it++) {
+        if (first) {
+            first = false;
+            continue;
+        }
+
+        // If the region_computed does not shrink, ancestors.at(i) (the loop
+        // nest one level further in) will never be considered as a compute
+        // location
+        if (!(*it)->region_computed_shrinks(&node, candidate)) {
+            break;
+        }
+
+        candidate = *it;
+    }
+
+    return candidate;
+}
+
+int64_t State::total_loop_extents_of_ancestors(const map<const LoopNest *, pair<const LoopNest *, int>> &parent, const LoopNest *loop) const {
+    int64_t total = 1;
+
+    if (loop->is_root()) {
+        return total;
+    }
+
+    const LoopNest *cur_loop = loop;
+    while (true) {
+        for (size_t i = 0; i < cur_loop->size.size(); ++i) {
+            total *= cur_loop->size[i];
+        }
+
+        if (parent.count(cur_loop) == 0) {
+            break;
+        }
+
+        cur_loop = parent.at(cur_loop).first;
+    }
+
+    return total;
+}
+
 const LoopNest *State::deepest_common_ancestor(const map<const LoopNest *, pair<const LoopNest *, int>> &parent, const LoopNest *a, const LoopNest *b) const {
     if (a->is_root()) return a;
     if (b->is_root()) return b;
@@ -290,7 +348,7 @@ void State::set_gpu_store_site(const map<const LoopNest *, pair<const LoopNest *
     const LoopNest *candidate_block = loop;
     while (candidate_block) {
         if (candidate_block->gpu_label == thread) {
-            site.gpu_store_memory_type = GPUMemoryType::local;
+            site.gpu_store_memory_type = GPUMemoryType::registers;
             type_has_been_set = true;
             break;
         }
@@ -373,10 +431,18 @@ bool State::compute_featurization(const FunctionDAG &dag, const MachineParams &p
         internal_assert(loop)
             << "Could not compute plausible site for unscheduled Func: "
             << n.func.name() << "\n";
+
+        // If 'loop' would never be considered as a compute location (i.e. by
+        // LoopNest::compute_in_tiles()), walk up the loop nest until we reach a
+        // location that would be considered
+        loop = deepest_valid_compute_location(parent, n, loop, feature_root.get());
+        int64_t num_realizations = total_loop_extents_of_ancestors(parent, loop);
+
         for (auto &stage : n.stages) {
             auto &site = sites.get_or_create(&stage);
             site.compute = loop;
             site.store = loop;
+            site.num_realizations = num_realizations;
             if (target.has_gpu_feature()) {
                 set_gpu_store_site(parent, loop, site);
             }
@@ -401,7 +467,7 @@ bool State::compute_featurization(const FunctionDAG &dag, const MachineParams &p
             const auto &feat = it.value();
 
             if (!feat.equal(verification_features.get(&stage))) {
-                feature_root->dump("", nullptr);
+                feature_root->dump();
                 std::cerr << "Feature Mismatch: " << stage.node->func.name() << "\n";
                 feat.dump();
                 std::cerr << "\n";
@@ -624,7 +690,11 @@ bool State::calculate_cost(const FunctionDAG &dag, const MachineParams &params, 
     for (auto it = features.begin(); it != features.end(); it++) {
         if (!it.key()->node->is_wrapper) {  // It's OK to repeatedly stage data
             auto &feat = it.value();
-            if (feat.points_computed_total + feat.inlined_calls > 8 * feat.points_computed_minimum) {
+            if (should_always_consider_inline(it.key()->node)) {
+                continue;
+            }
+
+            if (feat.points_computed_total + feat.inlined_calls > 10 * feat.points_computed_minimum) {
                 Filter(root.get()) << "Excess recompute for " << it.key()->node->func.name() << " stage " << it.key()->index << "\n"
                     << "points_computed_total = " << feat.points_computed_total << "\n"
                     << "inlined_calls = " << feat.inlined_calls << "\n"
@@ -659,12 +729,13 @@ IntrusivePtr<State> State::make_child() const {
     s->cost = cost;
     s->cost_per_stage = cost_per_stage;
     s->num_decisions_made = num_decisions_made;
+    s->always_consider_inline = always_consider_inline;
     return s;
 }
 
 void State::dump() const {
     aslog(0) << "State with cost " << cost << ":\n";
-    root->dump("", nullptr);
+    root->dump();
     aslog(0) << schedule_source;
 }
 
@@ -685,7 +756,7 @@ void State::print_compute_locations() const {
     aslog(0) << "END compute locations\n";
 }
 
-void State::fuse_gpu_blocks(LoopNest::StageScheduleState* state, Stage& stage, const vector<VarOrRVar>& parallel_vars, const vector<int64_t>& parallel_extents) const {
+void State::fuse_gpu_blocks(LoopNest::StageScheduleState* state, Stage& stage, const vector<VarOrRVar>& parallel_vars, const vector<int64_t>& parallel_extents, const vector<int>& constant_extents) const {
     if (parallel_vars.empty() || parallel_extents.empty()) {
         return;
     }
@@ -695,15 +766,23 @@ void State::fuse_gpu_blocks(LoopNest::StageScheduleState* state, Stage& stage, c
 
     std::vector<size_t> block_var_assignments[3];
 
+    // When parallel_vars/parallel_extents/constant_extents were created in apply_schedule,
+    // each entry was added in reverse order. Start from the end (the
+    // innermost dimension) and assign each var to a gpu_block.
     int i = parallel_vars.size() - 1;
     for (size_t block_i = 0; block_i < 3; ++block_i) {
         for (; i >= 0 && parallel_extents[i] * block_extents[block_i] <= max_blocks[block_i]; --i) {
-            block_extents[block_i] *= parallel_extents[i];
-            block_var_assignments[block_i].push_back(i);
+            if (parallel_extents[i] > 1 || !constant_extents[i]) {
+                block_extents[block_i] *= parallel_extents[i];
+                block_var_assignments[block_i].push_back(i);
 
-            if (i > (int)parallel_vars.size() - 3) {
-                --i;
-                break;
+                // Use a single block for the first 2 innermost dimensions. The
+                // remaining dimensions should all be assigned to the same block and
+                // fused
+                if (block_i < 2) {
+                    --i;
+                    break;
+                }
             }
         }
     }
@@ -780,39 +859,62 @@ bool State::mark_gpu_threads(LoopNest::StageScheduleState* state, Stage& stage, 
             for (const auto& to_be_staged : state->producers_to_be_staged) {
                 const auto* producer_node = to_be_staged.first;
 
-                Func producer(producer_node->func);
-                producer.in(func).store_in(MemoryType::Register).compute_at(func, v.var.var);
-                staged_funcs_schedule_source
-                    << producer.name()
-                    << ".in("
-                    << func.name()
-                    << ").store_in(MemoryType::Register).compute_at("
-                    << func.name()
-                    << ", "
-                    << v.var.var.name()
-                    << ")";
+                for (const auto& cur_pair : to_be_staged.second) {
+                    const LoopNest* loop_nest = cur_pair.first;
+                    const std::vector<const FunctionDAG::Edge*>& edge_chain = cur_pair.second;
 
-                const LoopNest* loop_nest = to_be_staged.second;
+                    internal_assert(edge_chain.at(0)->consumer == loop_nest->stage);
+                    internal_assert(edge_chain.back()->producer == producer_node);
 
-                const auto& bounds = loop_nest->get_bounds(producer_node);
+                    if (edge_chain.size() > 1) {
+                        std::string s = func.name();
+                        for (size_t i = 0; i < edge_chain.size() - 1; ++i) {
+                            s = edge_chain.at(i)->producer->func.name() + ".clone_in(" + s + ")";
+                        }
+                        aslog(0) << "Chain with length > 1: " << producer_node->func.name() << ".in(" << s << ")\n";
+                        continue;
+                    }
 
-                int i = 0;
-                for (const auto& l : producer_node->stages[0].loop) {
-                    Var unrolled_var(l.var);
+                    auto clone_in_chain = func;
+                    auto clone_in_chain_source_str = func.name();
 
-                    int extent = bounds->region_required(i++).extent();
-                    producer.in(func).bound_extent(unrolled_var, extent);
+                    for (size_t i = 0; i < edge_chain.size() - 1; ++i) {
+                        clone_in_chain = Func(edge_chain.at(i)->producer->func).clone_in(clone_in_chain);
+                        clone_in_chain_source_str = edge_chain.at(i)->producer->func.name() + ".clone_in(" + clone_in_chain_source_str + ")";
+                    }
+
+                    Func producer(producer_node->func);
+                    producer.in(clone_in_chain).store_in(MemoryType::Register).compute_at(func, v.var.var);
                     staged_funcs_schedule_source
-                        << "\n    .bound_extent("
-                        << unrolled_var.name()
+                        << producer.name()
+                        << ".in("
+                        << clone_in_chain_source_str
+                        << ").store_in(MemoryType::Register).compute_at("
+                        << func.name()
                         << ", "
-                        << extent
+                        << v.var.var.name()
                         << ")";
 
-                    producer.in(func).unroll(unrolled_var);
-                    staged_funcs_schedule_source << "\n    .unroll(" << unrolled_var.name() << ")";
+                    const auto& bounds = loop_nest->get_bounds_along_edge_chain(producer_node, edge_chain);
+
+                    int i = 0;
+                    for (const auto& l : producer_node->stages[0].loop) {
+                        Var unrolled_var(l.var);
+
+                        int extent = bounds->region_required(i++).extent();
+                        producer.in(clone_in_chain).bound_extent(unrolled_var, extent);
+                        staged_funcs_schedule_source
+                            << "\n    .bound_extent("
+                            << unrolled_var.name()
+                            << ", "
+                            << extent
+                            << ")";
+
+                        producer.in(clone_in_chain).unroll(unrolled_var);
+                        staged_funcs_schedule_source << "\n    .unroll(" << unrolled_var.name() << ")";
+                    }
+                    staged_funcs_schedule_source << ";\n";
                 }
-                staged_funcs_schedule_source << ";\n";
             }
         }
     }
@@ -899,6 +1001,7 @@ void State::apply_schedule(const FunctionDAG &dag, const MachineParams &params, 
         int64_t parallel_tasks = 1;
         vector<VarOrRVar> parallel_vars;
         vector<int64_t> parallel_extents;
+        vector<int> constant_extents;
         bool any_parallel_vars = false, any_parallel_rvars = false;
         for (auto it = p.second->vars.rbegin(); it != p.second->vars.rend(); it++) {
             if (!it->exists) continue;
@@ -908,6 +1011,7 @@ void State::apply_schedule(const FunctionDAG &dag, const MachineParams &params, 
             parallel_tasks *= it->extent;
             parallel_extents.push_back(it->extent);
             parallel_vars.push_back(it->var);
+            constant_extents.push_back(it->constant_extent);
         }
 
         if (p.second->vars.size() > 1) {
@@ -932,7 +1036,7 @@ void State::apply_schedule(const FunctionDAG &dag, const MachineParams &params, 
         // they are both pure.
         bool can_fuse = !(any_parallel_vars && any_parallel_rvars);
         if (can_fuse) {
-            fuse_gpu_blocks(p.second.get(), stage, parallel_vars, parallel_extents);
+            fuse_gpu_blocks(p.second.get(), stage, parallel_vars, parallel_extents, constant_extents);
         } else {
             if (target.has_gpu_feature()) {
                 mark_gpu_blocks(p.second.get(), stage, parallel_vars, parallel_extents);
@@ -1077,6 +1181,61 @@ void State::apply_schedule(const FunctionDAG &dag, const MachineParams &params, 
     // Sanitize the names of things to make them legal source code.
     schedule_source = src.str();
     sanitize_names(schedule_source);
+}
+
+bool State::should_always_consider_inline(const FunctionDAG::Node *node) const {
+    return always_consider_inline.contains(node) && always_consider_inline.get(node);
+}
+
+void State::update_always_consider_inline_options(const FunctionDAG::Node *node) {
+    if (node->is_output) {
+        return;
+    }
+
+    if (node->stages.size() > 1) {
+        return;
+    }
+
+    if (is_func_trivial_to_inline(node->func)) {
+        always_consider_inline.get_or_create(node) = true;
+        return;
+    }
+
+    if (node->is_pointwise) {
+        NodeMap<bool> currently_inlined;
+        root->collect_all_inlined(currently_inlined);
+
+        std::unordered_set<const FunctionDAG::Node*> non_inlined_consumers;
+        std::unordered_set<const FunctionDAG::Node *> done;
+        std::vector<const FunctionDAG::Node*> pending;
+        pending.push_back(node);
+
+        while (!pending.empty()) {
+            const auto *cur_node = pending.back();
+            pending.pop_back();
+
+            if (done.count(cur_node)) {
+                continue;
+            }
+            done.insert(cur_node);
+
+            for (const auto *e : cur_node->outgoing_edges) {
+                if (!currently_inlined.contains(e->consumer->node) || !currently_inlined.get(e->consumer->node)) {
+                    non_inlined_consumers.insert(e->consumer->node);
+                    continue;
+                }
+
+                pending.push_back(e->consumer->node);
+            }
+        }
+
+        if (non_inlined_consumers.size() > 1) {
+            return;
+        }
+
+        internal_assert(non_inlined_consumers.size() == 1);
+        always_consider_inline.get_or_create(node) = true;
+    }
 }
 
 }  // namespace Autoscheduler

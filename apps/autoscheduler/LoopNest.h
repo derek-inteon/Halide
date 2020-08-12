@@ -55,24 +55,6 @@ double get_idle_lane_wastage_limit();
 bool all(const vector<int>& v);
 bool accessed_at_constant_indices(const std::vector<int>& unrolled, const FunctionDAG::Edge* e);
 
-
-/** moves vectorized dimension first and also removes dimensions with size 1
-    to reflect actual thread dimensions when loop nests are lowered **/
-void lowered_dims(const vector<int64_t> &size, int vector_loop_i, vector<int64_t> &lowered_size);
-
-// creates tilings for gpu threads loops.
-// Innermost thread loop is always the vectorized dim and its extent is a multiple of 32.
-// Other loop extents are sized to be powers of 2 such that total extent is < 1024
-// called either when we are creating parallel -> (blocks, threads) loop when computing at root
-// OR when we are creating none -> (threads, SIMD) loop when computing at a serial loop
-// serial_inner = True when we're generating (thread, serial) tilings, False when generating (block,thread) tilings
-// max_s hold max gpu_thread counts of all siblings in each dimension. Used to make sure union of
-// thread counts is under 1024 threshold.
-vector<vector<int64_t>> generate_gpu_tilings(const vector<vector<int64_t>> &stage_sizes,
-        const vector<vector<int>> &pure_dims,
-        const vector<int64_t> &max_s,
-        int d, const vector<int> &vectorized_indices, bool serial_inner);
-
 // We're going to do a tree search over possible schedules to find an
 // optimal one. A tree search requires a state, and a function that
 // gives you children of the state (with costs). The following struct
@@ -219,6 +201,7 @@ struct LoopNest {
         GPUMemoryType gpu_store_memory_type; // global, local, shared?
         int64_t allocation_size = 0;         // Allocation size in bytes
         bool is_constant_allocation = false; // Does the allocation have constant size?
+        int64_t num_realizations = 0;        // Number of times this stage is realized. Only valid for unscheduled producers
         bool inlined = false;                // Is the Func inlined?
         uint64_t hash_of_producers_stored_at_root;
 
@@ -279,13 +262,17 @@ struct LoopNest {
 
     bool all_strides_exist(const LoadJacobian& jac, const FunctionDAG::Node* storage_node, const LoopNest& root) const;
 
+    int get_actual_vector_dim(const Bound &store_bounds) const;
+
     void compute_gpu_store_features(const LoadJacobian &jac, int consumer_innermost_dim, const FunctionDAG::Node *node, const Bound &consumer_store_bounds, const GPULoopInfo &gpu_loop_info, const std::vector<int64_t> &inner_serial_loop_extents, const Sites &consumer_site, ScheduleFeatures &feat, const LoopNest *parent, const LoopNest &root, GlobalMemInfo& global_mem_loads, SharedMemInfo& shared_mem_loads, LocalMemInfo& local_mem_loads, bool verbose=false) const;
 
-    bool can_vectorize_access_for_innermost_dim(const LoadJacobian &jac, const FunctionDAG::Node *accessed, int innermost_dim) const;
+    bool can_vectorize_access_for_innermost_dim(const LoadJacobian &jac, const FunctionDAG::Node *accessed, int innermost_dim, int loop_index) const;
 
-    bool can_vectorize_access(const LoadJacobian &jac, const FunctionDAG::Node *accessed, bool accessed_has_been_scheduled, int innermost_dim, const GPUMemoryType& mem_type) const;
+    bool can_vectorize_store_access(const LoadJacobian &jac, const FunctionDAG::Node *accessed, bool accessed_has_been_scheduled, int innermost_dim, int loop_index, const GPUMemoryType& mem_type) const;
 
-    int vectorized_access_size(bool verbose=false) const;
+    int vectorized_load_access_size(const LoadJacobian &jac, const FunctionDAG::Node *accessed, bool accessed_has_been_scheduled, int innermost_dim, const GPUMemoryType& mem_type, bool verbose=false) const;
+
+    int vectorized_access_size(size_t loop_index, bool verbose=false) const;
 
     template <typename T>
     void compute_num_mem_accesses_per_block(const LoadJacobian &jac, const FunctionDAG::Node *node, const Bound &store_bounds, const ThreadInfo &thread_info, int innermost_dim, double num_requests_per_warp, MemInfoType<T> &mem_info, bool verbose=false) const;
@@ -318,7 +305,8 @@ struct LoopNest {
 
     std::pair<const LoopNest*, const LoopNest*> find_innermost_and_parent() const;
 
-    double points_accessed_per_thread(const MachineParams& params, const Target& target, const GPULoopInfo &gpu_loop_info, const std::vector<const FunctionDAG::Edge*>& edge_chain, const LoadJacobian& jac, const LoopNest* parent, const LoopNest* grandparent, double n, const ScheduleFeatures &feat, bool verbose=false) const;
+    int64_t points_accessed_per_thread(const MachineParams& params, const Target& target, const GPULoopInfo &gpu_loop_info, const std::vector<const FunctionDAG::Edge*>& edge_chain, const LoadJacobian& jac, const LoopNest* parent, const LoopNest* grandparent, int64_t n, const ScheduleFeatures &feat, const LoadJacobian& serial_jac, bool producer_has_been_scheduled, int producer_innermost_dim, const GPUMemoryType& mem_type, bool verbose=false) const;
+
     int64_t compute_licm_amortization(const LoopNest* innermost, const LoopNest* parent, const ScheduleFeatures& feat, const LoadJacobian& jac, int producer_dims) const;
 
     void memoize_points_computed_minimum(StageMap<ScheduleFeatures>& memoized_features, const StageMap<ScheduleFeatures> *features) const;
@@ -382,8 +370,11 @@ struct LoopNest {
 
     void dump() const;
 
+    std::string to_string() const;
+
     // Recursively print a loop nest representation to stderr
-    void dump(string prefix, const LoopNest *parent) const;
+    template <typename T>
+    void dump(T& stream, string prefix, const LoopNest *parent) const;
 
     // Does this loop nest access the given Func
     bool calls(const FunctionDAG::Node *f) const;
@@ -512,7 +503,7 @@ struct LoopNest {
         vector<FuncVar> ordered_vars;
         vector<int64_t> gpu_thread_extents;
 
-        NodeMap<const LoopNest*> producers_to_be_staged;
+        NodeMap<std::vector<std::pair<const LoopNest*, std::vector<const FunctionDAG::Edge*>>>> producers_to_be_staged;
 
         // From outermost in
         vector<StageScheduleState*> ancestors;
@@ -526,6 +517,9 @@ struct LoopNest {
     int num_serial_loops(const FunctionDAG::Node::Stage* stage) const;
     int num_serial_loops() const;
     bool producer_computed_here_or_further_in(const FunctionDAG::Node* producer) const;
+
+    void update_producers_to_be_staged(StageScheduleState& state, const NodeMap<bool>& all_inlined) const;
+    bool region_computed_shrinks(const FunctionDAG::Node *f, const LoopNest *parent) const;
 
     // Apply the schedule represented by this loop nest to a Halide pipeline.
     void apply(LoopLevel here,

@@ -28,6 +28,7 @@ BEST_SCHEDULES_DIR=$(dirname $0)/best
 find_halide HALIDE_ROOT
 
 build_autoscheduler_tools ${HALIDE_ROOT}
+get_absolute_autoscheduler_bin_dir ${HALIDE_ROOT} AUTOSCHED_BIN
 
 export CXX="ccache c++"
 
@@ -35,20 +36,23 @@ export HL_MACHINE_PARAMS=80,24000000,160
 
 export HL_PERMIT_FAILED_UNROLL=1
 
-if [ -z ${HL_TARGET} ]; then
+export AUTOSCHED_BIN=${AUTOSCHED_BIN}
+echo "AUTOSCHED_BIN set to ${AUTOSCHED_BIN}"
+
+export SEARCH_SPACE_OPTIONS=01111
+echo "SEARCH_SPACE_OPTIONS set to ${SEARCH_SPACE_OPTIONS}"
+echo
+
+if [ ! -v HL_TARGET ]; then
     get_host_target ${HALIDE_ROOT} HL_TARGET
-    HL_TARGET=${HL_TARGET}-cuda
+    HL_TARGET=${HL_TARGET}-cuda-cuda_capability_61
 fi
 
 export HL_TARGET=${HL_TARGET}
 
 echo "HL_TARGET set to ${HL_TARGET}"
 
-if [ -z ${SAMPLES_DIR} ]; then
-    DEFAULT_SAMPLES_DIR_NAME=autotuned_samples
-else
-    DEFAULT_SAMPLES_DIR_NAME=${SAMPLES_DIR}
-fi
+DEFAULT_SAMPLES_DIR_NAME="${SAMPLES_DIR:-autotuned_samples}"
 
 CURRENT_DATE_TIME="`date +%Y-%m-%d-%H-%M-%S`";
 
@@ -76,9 +80,9 @@ function ctrl_c() {
 trap ctrl_c INT
 
 if [ -z $APP ]; then
-    APPS="bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur_generator depthwise_separable_conv"
+    APPS="bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur depthwise_separable_conv"
 else
-    APPS=$APP
+    APPS=${APP}
 fi
 
 NUM_APPS=0
@@ -114,7 +118,7 @@ for app in $APPS; do
     ITERATION=1
 
     if [[ $PREDICT_ONLY != 1 ]]; then
-        while [[ DONE -ne 1 ]]; do
+        while [[ 1 ]]; do
             TRAIN_ONLY=${TRAIN_ONLY} SAMPLES_DIR=${SAMPLES_DIR} make -C ${APP_DIR} autotune | tee -a ${OUTPUT_FILE}
 
             if [[ $ITERATION -ge $MAX_ITERATIONS ]]; then

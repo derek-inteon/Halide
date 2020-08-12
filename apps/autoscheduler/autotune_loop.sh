@@ -75,11 +75,11 @@ fi
 
 # We could add this unconditionally, but it's easier to wade thru
 # results if we only add if needed
-for F in disable_llvm_loop_opt; do
-    if [[ ! ${HL_TARGET} =~ .*${F}.* ]]; then
-        HL_TARGET="${HL_TARGET}-${F}"
-    fi
-done
+#for F in disable_llvm_loop_opt; do
+    #if [[ ! ${HL_TARGET} =~ .*${F}.* ]]; then
+        #HL_TARGET="${HL_TARGET}-${F}"
+    #fi
+#done
 
 if [ $(uname -s) = "Darwin" ]; then
     LOCAL_CORES=`sysctl -n hw.ncpu`
@@ -92,13 +92,20 @@ echo Local number of cores detected as ${LOCAL_CORES}
 # benchmarked serially.
 BATCH_SIZE=${LOCAL_CORES}
 NUM_CORES=80
-EPOCHS=100
+EPOCHS=200
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 
 echo "# GPUs = ${NUM_GPUS}"
 
-USE_BENCHMARK_QUEUE=1
+USE_BENCHMARK_QUEUE="${USE_BENCHMARK_QUEUE:-0}"
 BENCHMARK_QUEUE_DIR=${SAMPLES}/benchmark_queue
+
+ENABLE_BEAM_SEARCH=${ENABLE_BEAM_SEARCH:-1}
+if [[ ${ENABLE_BEAM_SEARCH} == 1 ]]; then
+    echo "Beam search: ON"
+else
+    echo "Beam search: OFF"
+fi
 
 # Latest git hash
 GIT_HASH=$(git rev-parse --verify HEAD)
@@ -140,7 +147,8 @@ make_featurization() {
     mkdir -p ${D}
     rm -f "${D}/${FNAME}.featurization"
     rm -f "${D}/${FNAME}.sample"
-    if [[ $D == */0 ]]; then
+
+    if [[ $D == */0 && ${ENABLE_BEAM_SEARCH} == 1 ]]; then
         # Sample 0 in each batch is best effort beam search, with no randomness
         dropout=100
         beam=32
@@ -203,8 +211,7 @@ make_featurization() {
         ${D}/*.registration.cpp \
         ${D}/*.a \
         -o ${D}/bench \
-        -DHALIDE_NO_PNG -DHALIDE_NO_JPEG \
-        -ldl -lpthread"
+        -ljpeg -lpng16 -ldl -lpthread"
 
     eval $CMD
     FAILED=0
@@ -222,6 +229,8 @@ make_featurization() {
     record_command $BATCH $SAMPLE_ID "$CMD" "compile_command" $FAILED
 }
 
+IMAGES_DIR="${HALIDE_ROOT}/apps/images"
+
 # Benchmark one of the random samples
 benchmark_sample() {
     D=${1}
@@ -230,6 +239,9 @@ benchmark_sample() {
     GPU_INDEX=${8}
 
     if [[ ! -f ${D}/bench ]]; then
+        if [[ $USE_BENCHMARK_QUEUE == 1 ]]; then
+            mv "${BENCHMARK_QUEUE_DIR}/${BATCH}-${SAMPLE_ID}-benchmarking-gpu_${GPU_INDEX}" "${BENCHMARK_QUEUE_DIR}/${BATCH}-${SAMPLE_ID}-completed"
+        fi
         return
     fi
 
@@ -239,13 +251,12 @@ benchmark_sample() {
 
     if [ $PIPELINE == "random_pipeline" ]; then
         CMD="${CMD} \
-            --output_extents=estimate \
-            --default_input_buffers=random:0:auto \
-            --default_input_scalars=estimate \
+            --estimate_all \
             --benchmarks=all"
     else
+        get_bench_args ${IMAGES_DIR} ${PIPELINE} ${D} BENCH_ARGS
         CMD="${CMD} \
-            --estimate_all \
+            ${BENCH_ARGS} \
             --benchmarks=all"
     fi
 
@@ -320,6 +331,9 @@ benchmark_sample() {
     record_command $BATCH $SAMPLE_ID "$TRACE_CMD" "trace_256_command" $FAILED
 
     if [[ ${FAILED} == 1 ]]; then
+        if [[ $USE_BENCHMARK_QUEUE == 1 ]]; then
+            mv "${BENCHMARK_QUEUE_DIR}/${BATCH}-${SAMPLE_ID}-benchmarking-gpu_${GPU_INDEX}" "${BENCHMARK_QUEUE_DIR}/${BATCH}-${SAMPLE_ID}-completed"
+        fi
         return
     fi
 
@@ -340,6 +354,10 @@ benchmark_sample() {
     rm ${D}/${FNAME}.stmt
     rm ${D}/${FNAME}.h
     rm ${D}/${FNAME}.registration.cpp
+
+    if [[ $USE_BENCHMARK_QUEUE == 1 ]]; then
+        mv "${BENCHMARK_QUEUE_DIR}/${BATCH}-${SAMPLE_ID}-benchmarking-gpu_${GPU_INDEX}" "${BENCHMARK_QUEUE_DIR}/${BATCH}-${SAMPLE_ID}-completed"
+    fi
 }
 
 if [[ $BATCH_ID == 0 ]]; then
@@ -379,14 +397,21 @@ benchmark_loop() {
             BATCH=$(echo "${FILE}" | cut -d- -f 1)
             SAMPLE_DIR="${SAMPLES}/${BATCH}/${SAMPLE_ID}"
 
-            if { [[ -f "${SAMPLE_DIR}/bench.txt" ]] && ! grep -q "Permission denied" "${SAMPLE_DIR}/bench_err.txt"; }; then
+            # We sometimes encounter spurious permission denied errors. Usually,
+            # retrying will resolve them so remove from this file the
+            # '-completed' tag and let it be benchmarked again
+            if grep -q "Permission denied" "${SAMPLE_DIR}/bench_err.txt"; then
+                FILE=${FILE%-completed}
+            fi
+
+            if [[ -f "${SAMPLE_DIR}/bench.txt" ]] && [[ $FILE == *"-completed" ]]; then
                 # Benchmarking has been completed
                 num_completed=$((num_completed+1))
                 rm "${BENCHMARK_QUEUE_DIR}/${FILE}"
                 continue
             fi
 
-            if [[ $FILE == *"benchmarking" ]]; then
+            if [[ $FILE == *"benchmarking"* ]]; then
                 # Sample is still benchmarking
                 continue
             fi
@@ -396,12 +421,14 @@ benchmark_loop() {
             DIR=${SAMPLES}/${BATCH}
 
             while [[ 1 ]]; do
-                if find_unused_gpu ${NUM_GPUS} gpu_id; then
+                if find_unused_gpu ${BENCHMARK_QUEUE_DIR} ${NUM_GPUS} gpu_id; then
                     S=$(printf "%04d%04d" $BATCH_ID $SAMPLE_ID)
                     FNAME=$(printf "%s_batch_%04d_sample_%04d" ${PIPELINE} $BATCH_ID $SAMPLE_ID)
+                    # Mark this file with gpu_${gpu_id} so we know that GPU is
+                    # occupied
+                    mv "${BENCHMARK_QUEUE_DIR}/${FILE}" "${BENCHMARK_QUEUE_DIR}/${FILE}-benchmarking-gpu_${gpu_id}"
                     benchmark_sample "${DIR}/${SAMPLE_ID}" $S $BATCH $SAMPLE_ID $EXTRA_ARGS_IDX $FNAME $BATCH_ID $gpu_id &
                     waitlist+=("$!")
-                    mv "${BENCHMARK_QUEUE_DIR}/${FILE}" "${BENCHMARK_QUEUE_DIR}/${FILE}-benchmarking"
                     break
                 else
                     # All GPUs are in use
@@ -432,6 +459,8 @@ benchmark_loop() {
 
 MAX_AUTOSCHEDULE_JOBS=${LOCAL_CORES}
 
+BENCHMARK_QUEUE_ENABLED=0
+
 if [[ $USE_BENCHMARK_QUEUE == 1 ]] && [[ $TRAIN_ONLY != 1 ]]; then
     echo "Benchmark queue = ON"
     mkdir -p ${BENCHMARK_QUEUE_DIR}
@@ -439,6 +468,7 @@ if [[ $USE_BENCHMARK_QUEUE == 1 ]] && [[ $TRAIN_ONLY != 1 ]]; then
     MAX_AUTOSCHEDULE_JOBS=$((LOCAL_CORES-NUM_GPUS))
     benchmark_loop &
     benchmark_loop_pid=("$!")
+    BENCHMARK_QUEUE_ENABLED=1
 else
     echo "Benchmark queue = OFF"
 fi
@@ -514,7 +544,7 @@ if [[ $TRAIN_ONLY != 1 ]]; then
     done
 fi
 
-if [[ $USE_BENCHMARK_QUEUE == 1 ]]; then
+if [[ $BENCHMARK_QUEUE_ENABLED == 1 ]]; then
     wait "${benchmark_loop_pid}"
 fi
 
