@@ -61,6 +61,17 @@ function get_autoscheduler_scripts_dir() {
     autoscheduler_scripts_dir_ref=${halide_root}/apps/autoscheduler/scripts
 }
 
+function build_rungenmain() {
+    local -r halide_root=$1
+    get_autoscheduler_dir $halide_root autoscheduler_dir
+    get_autoscheduler_bin_dir autoscheduler_bin_dir
+
+    echo
+    echo "Building RunGenMain..."
+    make -C ${autoscheduler_dir} ${autoscheduler_bin_dir}/RunGenMain.o
+    echo
+}
+
 function build_featurization_to_sample() {
     local -r halide_root=$1
     get_autoscheduler_dir $halide_root autoscheduler_dir
@@ -127,6 +138,7 @@ function build_autoscheduler_tools() {
     build_retrain_cost_model $halide_root
     build_libauto_schedule $halide_root
     build_get_host_target $halide_root
+    build_rungenmain $halide_root
     echo
 }
 
@@ -141,13 +153,14 @@ function retrain_cost_model() {
     local -r predictions_file=${8-""}
     local -r verbose=${9-0}
     local -r partition_schedules=${10-0}
+    local -r limit=${11-0}
 
     get_absolute_autoscheduler_bin_dir ${halide_root} autosched_bin
 
     echo "Using learning rate: ${learning_rate}"
 
     find ${samples_dir} -name "*.sample" | \
-        ${autosched_bin}/retrain_cost_model \
+         HL_NUM_THREADS=8 ${autosched_bin}/retrain_cost_model \
             --epochs=${num_epochs} \
             --rates=${learning_rate} \
             --num_cores=${num_cores} \
@@ -157,7 +170,8 @@ function retrain_cost_model() {
             --best_schedule=${samples_dir}/best.${pipeline_id}.schedule.h \
             --predictions_file=${predictions_file} \
             --verbose=${verbose} \
-            --partition_schedules=${partition_schedules}
+            --partition_schedules=${partition_schedules} \
+            --limit=${limit}
 }
 
 function predict_cost() {
@@ -247,9 +261,10 @@ function predict_all() {
     local -r weights_dir=$3
     local -r predictions_file=$4
     local -r include_filenames=$5
+    local -r limit=$6
 
     get_autoscheduler_scripts_dir ${halide_root} scripts_dir
-    bash ${scripts_dir}/predict_all.sh ${samples_dir} ${weights_dir} ${predictions_file} ${include_filenames}
+    bash ${scripts_dir}/predict_all.sh ${samples_dir} ${weights_dir} ${predictions_file} ${include_filenames} ${limit}
 }
 
 function extract_best_times() {
@@ -337,14 +352,20 @@ function extract_best_sample_details() {
 function save_best_schedule_result() {
     local -r results_dir=$1
     local -r samples_dir=$2
+    mkdir -p ${results_dir}
 
     local -r app=$(basename $(dirname $samples_dir))
 
     echo "Comparing candidate results with current best for ${app}"
 
     local -r candidate_details_file=${samples_dir}/best.txt
-    local -r generator_name=${app#"cuda_"}
-    local -r candidate_schedule_file=${samples_dir}/best.${generator_name%"_generator"}.schedule.h
+    if [[ ${app} == "mobilenet"* ]]; then
+        local -r generator_name="onnx_model_generator"
+        local -r candidate_schedule_file=${samples_dir}/best.${generator_name}.schedule.h
+    else
+        local -r generator_name=${app#"cuda_"}
+        local -r candidate_schedule_file=${samples_dir}/best.${generator_name%"_generator"}.schedule.h
+    fi
     local -r candidate_weights_file=${samples_dir}/best.weights
     local -r candidate_autotune_out_file=${samples_dir}/autotune_out.txt
 
@@ -394,7 +415,7 @@ function save_best_schedule_result() {
 function print_best_schedule_times() {
     local -r dir=$1
 
-    local -r apps="resnet_50_blockwise bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur depthwise_separable_conv"
+    local -r apps="resnet_50_blockwise bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur depthwise_separable_conv mobilenet0 mobilenet1 mobilenet2 mobilenet3 mobilenet4 mobilenet5 mobilenet6 mobilenet7"
 
     for app in $apps; do
         local file=$dir/$app.txt

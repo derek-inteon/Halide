@@ -7,8 +7,10 @@
 
 #include "interpolate.h"
 #ifndef NO_AUTO_SCHEDULE
-#include "interpolate_auto_schedule.h"
-#include "interpolate_gradient_auto_schedule.h"
+    #include "interpolate_auto_schedule.h"
+#endif
+#ifndef NO_GRADIENT_AUTO_SCHEDULE
+    #include "interpolate_gradient_auto_schedule.h"
 #endif
 
 #include "benchmark_util.h"
@@ -25,13 +27,16 @@ int main(int argc, char **argv) {
     Halide::Runtime::Buffer<float> input = load_and_convert_image(argv[1]);
     Halide::Runtime::Buffer<float> output(input.width(), input.height(), 3);
 
-    multi_way_bench({
-        {"interpolate Manual", [&]() { interpolate(input, output); output.device_sync(); }},
-    #ifndef NO_AUTO_SCHEDULE
-        {"interpolate Auto-scheduled", [&]() { interpolate_auto_schedule(input, output); output.device_sync(); }},
-        {"interpolate Gradient auto-scheduled", [&]() { interpolate_gradient_auto_schedule(input, output); output.device_sync(); }}
-    #endif
+    multi_way_bench({{"interpolate Manual", [&]() { interpolate(input, output); output.device_sync(); }},
+#ifndef NO_AUTO_SCHEDULE
+                     {"interpolate Auto-scheduled", [&]() { interpolate_auto_schedule(input, output); output.device_sync(); }},
+#endif
+#ifndef NO_GRADIENT_AUTO_SCHEDULE
+                     {"interpolate Gradient auto-scheduled", [&]() { interpolate_gradient_auto_schedule(input, output); output.device_sync(); }}
+#endif
     });
+
+    output.copy_to_host();
 
     convert_and_save_image(output, argv[2]);
 

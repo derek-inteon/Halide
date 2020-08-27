@@ -30,7 +30,7 @@ find_halide HALIDE_ROOT
 build_autoscheduler_tools ${HALIDE_ROOT}
 get_absolute_autoscheduler_bin_dir ${HALIDE_ROOT} AUTOSCHED_BIN
 
-export CXX="ccache c++"
+export CXX="ccache ${CXX}"
 
 export HL_MACHINE_PARAMS=80,24000000,160
 
@@ -45,7 +45,7 @@ echo
 
 if [ ! -v HL_TARGET ]; then
     get_host_target ${HALIDE_ROOT} HL_TARGET
-    HL_TARGET=${HL_TARGET}-cuda-cuda_capability_61
+    HL_TARGET=${HL_TARGET}-cuda-cuda_capability_70
 fi
 
 export HL_TARGET=${HL_TARGET}
@@ -63,12 +63,31 @@ function ctrl_c() {
     for app in $APPS; do
         ps aux | grep ${app}.generator | awk '{print $2}' | xargs kill
 
-        LATEST_SAMPLES_DIR=$(ls -ld $APP_DIR/${DEFAULT_SAMPLES_DIR_NAME}* | tail -n 1 | rev | cut -d" " -f 1 | rev)
-        if [[ ${RESUME} -eq 1 && -d ${LATEST_SAMPLES_DIR} ]]; then
+        unset -v LATEST_SAMPLES_DIR
+        for f in "$APP_DIR/${DEFAULT_SAMPLES_DIR_NAME}"*; do
+            if [[ ! -d $f ]]; then
+               continue
+           fi
+
+            if [[ -z ${LATEST_SAMPLES_DIR+x} || $f -nt $LATEST_SAMPLES_DIR ]]; then
+                LATEST_SAMPLES_DIR=$f
+            fi
+        done
+
+        if [[ ${RESUME} -eq 1 && -z ${LATEST_SAMPLES_DIR+x} ]]; then
             SAMPLES_DIR=${LATEST_SAMPLES_DIR}
         else
-            SAMPLES_DIR_NAME=${DEFAULT_SAMPLES_DIR_NAME}-${CURRENT_DATE_TIME}
-            SAMPLES_DIR="${APP_DIR}/${SAMPLES_DIR_NAME}"
+            while [[ 1 ]]; do
+                SAMPLES_DIR_NAME=${DEFAULT_SAMPLES_DIR_NAME}-${CURRENT_DATE_TIME}
+                SAMPLES_DIR="${APP_DIR}/${SAMPLES_DIR_NAME}"
+
+                if [[ ! -d ${SAMPLES_DIR} ]]; then
+                    break
+                fi
+
+                sleep 1
+                CURRENT_DATE_TIME="`date +%Y-%m-%d-%H-%M-%S`";
+            done
         fi
         save_best_schedule_result ${BEST_SCHEDULES_DIR} ${SAMPLES_DIR}
     done
@@ -81,6 +100,7 @@ trap ctrl_c INT
 
 if [ -z $APP ]; then
     APPS="bgu bilateral_grid local_laplacian nl_means lens_blur camera_pipe stencil_chain harris hist max_filter unsharp interpolate conv_layer cuda_mat_mul iir_blur depthwise_separable_conv"
+ #mobilenet0 mobilenet1 mobilenet2 mobilenet3 mobilenet4 mobilenet5 mobilenet6 mobilenet7
 else
     APPS=${APP}
 fi
@@ -96,12 +116,32 @@ for app in $APPS; do
     SECONDS=0
     APP_DIR="${HALIDE_ROOT}/apps/${app}"
 
-    LATEST_SAMPLES_DIR=$(ls -ld $APP_DIR/${DEFAULT_SAMPLES_DIR_NAME}* | tail -n 1 | rev | cut -d" " -f 1 | rev)
-    if [[ ${RESUME} -eq 1 && -d ${LATEST_SAMPLES_DIR} ]]; then
+    unset -v LATEST_SAMPLES_DIR
+    for f in "$APP_DIR/${DEFAULT_SAMPLES_DIR_NAME}"*; do
+        if [[ ! -d $f ]]; then
+           continue
+       fi
+
+        if [[ -z ${LATEST_SAMPLES_DIR+x} || $f -nt $LATEST_SAMPLES_DIR ]]; then
+            LATEST_SAMPLES_DIR=$f
+        fi
+    done
+
+    if [[ ${RESUME} -eq 1 && -z ${LATEST_SAMPLES_DIR+x} ]]; then
         SAMPLES_DIR=${LATEST_SAMPLES_DIR}
         echo "Resuming from existing run: ${SAMPLES_DIR}"
     else
-        SAMPLES_DIR_NAME=${DEFAULT_SAMPLES_DIR_NAME}-${CURRENT_DATE_TIME}
+        while [[ 1 ]]; do
+            SAMPLES_DIR_NAME=${DEFAULT_SAMPLES_DIR_NAME}-${CURRENT_DATE_TIME}
+            SAMPLES_DIR="${APP_DIR}/${SAMPLES_DIR_NAME}"
+
+            if [[ ! -d ${SAMPLES_DIR} ]]; then
+                break
+            fi
+
+            sleep 1
+            CURRENT_DATE_TIME="`date +%Y-%m-%d-%H-%M-%S`";
+        done
         SAMPLES_DIR="${APP_DIR}/${SAMPLES_DIR_NAME}"
         echo "Starting new run in: ${SAMPLES_DIR}"
     fi
@@ -115,22 +155,12 @@ for app in $APPS; do
     mkdir -p ${SAMPLES_DIR}
     touch ${OUTPUT_FILE}
 
-    ITERATION=1
-
     if [[ $PREDICT_ONLY != 1 ]]; then
-        while [[ 1 ]]; do
-            TRAIN_ONLY=${TRAIN_ONLY} SAMPLES_DIR=${SAMPLES_DIR} make -C ${APP_DIR} autotune | tee -a ${OUTPUT_FILE}
-
-            if [[ $ITERATION -ge $MAX_ITERATIONS ]]; then
-                break
-            fi
-
-            ITERATION=$((ITERATION + 1))
-        done
+        NUM_BATCHES=${MAX_ITERATIONS} TRAIN_ONLY=${TRAIN_ONLY} SAMPLES_DIR=${SAMPLES_DIR} make -C ${APP_DIR} autotune | tee -a ${OUTPUT_FILE}
     fi
 
     WEIGHTS_FILE="${SAMPLES_DIR}/updated.weights"
-    predict_all ${HALIDE_ROOT} ${SAMPLES_DIR} ${WEIGHTS_FILE} ${PREDICTIONS_WITH_FILENAMES_FILE} 1
+    predict_all ${HALIDE_ROOT} ${SAMPLES_DIR} ${WEIGHTS_FILE} ${PREDICTIONS_WITH_FILENAMES_FILE} 1 ${LIMIT:-0}
     awk -F", " '{printf("%f, %f\n", $2, $3);}' ${PREDICTIONS_WITH_FILENAMES_FILE} > ${PREDICTIONS_FILE}
 
     find_outliers ${PREDICTIONS_WITH_FILENAMES_FILE} ${OUTLIERS_FILE}
@@ -144,7 +174,6 @@ for app in $APPS; do
     echo "Total autotune time (s): ${SECONDS}" >> ${OUTPUT_FILE}
 
     save_best_schedule_result ${BEST_SCHEDULES_DIR} ${SAMPLES_DIR}
-    python3 ${SCRIPTS_DIR}/scatter.py --predictions ${PREDICTIONS_FILE} --app ${app} --output ${SAMPLES_DIR}
 
     if [[ $COMPARE_WITH_METRICS == 1 ]]; then
         echo "Comparing with metrics..."
