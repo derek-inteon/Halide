@@ -201,7 +201,7 @@ public:
             loop_nest.push_back(line);
         }
 
-        return std::make_unique<LoopNestParser>(loop_nest);
+        return std::unique_ptr<LoopNestParser>(new LoopNestParser(loop_nest) );
     }
 };
 
